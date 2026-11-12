@@ -21,8 +21,11 @@ def test_revoked_role_drains_silent_exec_process(tmp_path, monkeypatch):
     project.mkdir()
     binary = write_python_host_fixture(tmp_path / "codex", f"""#!{sys.executable}
 from pathlib import Path
+import signal
+import sys
 import time
 from loopx.file_lock import try_exclusive_file_lock
+signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
 with try_exclusive_file_lock(Path('active-role')) as lock:
     assert lock is not None
     Path('started').touch()
@@ -123,7 +126,7 @@ def test_correction_readback_never_starts_another_uncertain_or_completed_attempt
 
 @pytest.mark.skipif(os.environ.get("LOOPX_TEST_NATIVE_ROLE_HOST") != "1",
                     reason="opt-in installed Codex with native filesystem isolation")
-@pytest.mark.parametrize("entry", ["turn", "benchmark", "receipt-repair"])
+@pytest.mark.parametrize("entry", ["turn", "benchmark", "receipt-repair", "goal-stop"])
 def test_real_native_feedback_changes_the_checked_artifact(tmp_path, entry):
     from tests.control_plane.canonical_authority_fixture import initialize_canonical_source_fixture
     from tests.control_plane.codex_checkpoint_fixture import local_inference_provider
@@ -141,6 +144,10 @@ def test_real_native_feedback_changes_the_checked_artifact(tmp_path, entry):
     task_file = tmp_path / "worker-task.txt"
     task_file.write_text(source_task)
     pinned_task = entry != "turn"
+    if entry == "goal-stop":
+        (project / "docs").mkdir(exist_ok=True)
+    tool_started = project / "docs" / "tool-started"
+    late_write = project / "docs" / "after-stop"
     key = None
     inputs = []
     def respond(request, index, message):
@@ -150,6 +157,16 @@ def test_real_native_feedback_changes_the_checked_artifact(tmp_path, entry):
                        for part in item["content"] if isinstance(part, dict))
         text = [part["text"] for item in request["input"] if item.get("role") == "user"
                 for part in item["content"] if "text" in part][-1]
+        if entry == "goal-stop" and index == 2:
+            command = ("/bin/sleep 6 & tool_pid=$!; "
+                       "printf '%s\\n' \"$$ $tool_pid\" > docs/tool-started; "
+                       "wait \"$tool_pid\"; /usr/bin/touch docs/after-stop")
+            return {"type": "function_call", "id": "fc_stop", "call_id": "call_stop",
+                    "name": "exec_command", "arguments": json.dumps({"cmd": command, "yield_time_ms": 1000})}
+        if entry == "goal-stop" and index > 2:
+            # Keep the Worker waiting for its tool while the Goal is stopped.
+            time.sleep(6)
+            return message
         if index == 4:
             return {"type": "function_call", "id": "fc_readonly", "call_id": "call_readonly",
                     "name": "exec_command", "arguments": json.dumps({"cmd": "touch controller-write-probe"})}
@@ -243,6 +260,33 @@ def test_real_native_feedback_changes_the_checked_artifact(tmp_path, entry):
                    "--turn-instance-id", "direct-roles", "--timeout-seconds", "45", "--codex-bin", binary,
                    material_option, str(material), "--codex-sandbox", "workspace-write",
                    "--validation-command-json", json.dumps(fixture["_validator_command"](expected))]
+        if entry == "goal-stop":
+            from loopx.control_plane.goals.activation_service import set_goal_activation_state
+
+            with subprocess.Popen(cmd, cwd=project, env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) as process:
+                try:
+                    deadline = time.monotonic() + 30
+                    while not tool_started.is_file() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(.025)
+                    assert tool_started.is_file(), "the installed Codex never started its native tool"
+                    pids = tool_started.read_text().split()
+                    assert len(pids) == 2
+                    stopped = set_goal_activation_state(registry_path=registry, goal_id=goal, state="stopped",
+                        actor_kind="owner", reason="Stop the running test Goal",
+                        runtime_root_override=str(runtime), execute=True)
+                    assert stopped["ok"] and stopped["readback"]["verified"], stopped
+                    output, error = process.communicate(timeout=15)
+                    assert process.returncode == 1 and not json.loads(output)["ok"], (output, error)
+                    states = subprocess.run(["ps", "-p", ",".join(pids), "-o", "stat="],
+                        capture_output=True, text=True, timeout=5).stdout.split()
+                    assert all(state.startswith("Z") for state in states), states
+                    assert not late_write.exists()
+                    assert fixture["_quota_spend_count"](runtime) == 0
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+            return
         completed = subprocess.run(cmd, cwd=project, env=env, timeout=85, capture_output=True, text=True)
         if entry == "receipt-repair":
             first = json.loads(completed.stdout)

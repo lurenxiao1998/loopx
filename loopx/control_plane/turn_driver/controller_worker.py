@@ -241,7 +241,7 @@ class RoleTransport:
                 run = run_host_process(command, project=self.host.project, input_text=prompt,
                     timeout_seconds=self.remaining(), on_stdout=events.feed, on_stderr=diagnostics.feed,
                     launch_guard=lambda: self.admission.launch_lifetime(operation="turn_role_turn_start"),
-                    check_running=self.check_running)
+                    check_running=self.check_running, interrupt_before_terminate=True)
                 events.finish()
                 diagnostics.finish()
                 if (run["outcome"] != "exited" or run["returncode"] != 0 or not run["output_complete"]
