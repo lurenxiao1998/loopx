@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import shlex
 
-from ...command_invocation import loopx_cli_argv
+from ...command_invocation import current_loopx_cli_argv, loopx_cli_argv
 from ...file_lock import exclusive_file_lock
 from ...control_plane.collaboration import conversation_scope
 from ...control_plane.collaboration.source_grant_observation import (
@@ -228,7 +228,7 @@ def deliver(
 
 
 def turn_start_hook(
-    runtime_root: Path, registry_path: Path, goal_id: str, agent_id: str
+    runtime_root: Path, registry_path: Path, goal_id: str, agent_id: str, *, model_read: bool = False
 ):
     from ...control_plane.capability_hooks import (
         TurnStartHookRegistration,
@@ -280,15 +280,18 @@ def turn_start_hook(
             "error_code": error,
         }
 
+    # Only the producing CLI is known to support the progressive Inbox view.
+    cli_argv = current_loopx_cli_argv() if model_read else loopx_cli_argv()
     command = shlex.join(
         [
-            *loopx_cli_argv(),
+            *cli_argv,
             "--registry",
             str(registry_path),
             "--runtime-root",
             str(runtime_root),
             "manager-inbox",
             "read",
+            *(["--format", "markdown"] if model_read else []),
             "--goal-id",
             goal_id,
             "--agent-id",

@@ -248,7 +248,11 @@ def _dispatch_quota_turn_start_hooks(
             agent_id=args.agent_id,
             available=args.available_capabilities,
         )
-        context_dispatch = dispatch_turn_start_hooks((turn_start_hook(root, registry_path, args.goal_id, args.agent_id),))
+        model_read = (not getattr(args, "scheduler_observation", False)
+                      and native_context_activation(args)["progressive_enabled"])
+        context_dispatch = dispatch_turn_start_hooks((
+            turn_start_hook(root, registry_path, args.goal_id, args.agent_id, model_read=model_read),
+        ))
         from ..capabilities.semantic_preference.agent_preferences import extend_turn_start_dispatch as extend_preferences
         context_dispatch = extend_preferences(context_dispatch, runtime_root=root, registry_path=registry_path,
             goal_id=args.goal_id, agent_id=args.agent_id)
@@ -313,8 +317,8 @@ def _prepare_quota_result_context(
     payload: dict[str, object], args: argparse.Namespace, *,
     context: QuotaCommandContext | None, registry_path: Path,
     heartbeat_turn_id: str | None, capture_directory: Path | None, reader_argv: list[str],
-) -> tuple[dict[str, object], dict[str, Any]]:
-    """Bind optional Turn context after the capture and settlement route is decided."""
+) -> tuple[dict[str, object], dict[str, Any], list[dict[str, Any]]]:
+    """Stage optional context after the capture and settlement route is decided."""
     try:
         activation = native_context_activation(args)
     except QuotaCommandValidationError:
@@ -323,7 +327,9 @@ def _prepare_quota_result_context(
         # Preserve the original validation error when activation itself failed.
         activation = {"progressive_enabled": False, "enabled": False}
     if args.quota_command == "should-run":
-        if (args.format == "json" and capture_directory is not None and activation["progressive_enabled"]
+        if getattr(args, "complete_turn", False):
+            payload = _project_native_cli_settlement(payload, explicit_complete=True)
+        elif (args.format == "json" and capture_directory is not None and activation["progressive_enabled"]
                 and activation.get("scenario") == "codex_app_heartbeat"
                 and (getenv("CODEX_THREAD_ID") or getattr(args, "prepared_capture_reference", False))
                 and (getattr(args, "codex_context_dir", None) or getattr(args, "codex_context_root", None))
@@ -344,14 +350,13 @@ def _prepare_quota_result_context(
             payload,
             registry_path=registry_path,
         )
+    capability_context = []
     if args.quota_command == "should-run":
-        # The capture route and optional settlement attachments are already
-        # fixed. Bind the hook to the same typed settlement as the capture.
-        attach_reward_memory_recall_after_should_run(
+        capability_context = attach_reward_memory_recall_after_should_run(
             payload, quota_command=args.quota_command, heartbeat_turn_id=heartbeat_turn_id,
             registry_path=registry_path, goal_id=args.goal_id, agent_id=args.agent_id,
         )
-    return payload, activation
+    return payload, activation, capability_context
 
 
 def _emit_scheduler_observation_result(
@@ -366,6 +371,8 @@ def _emit_scheduler_observation_result(
 ) -> int:
     """Emit the bounded observer without entering native capture or settlement."""
     if context is not None:
+        _export("attach_host_poll_receipt")(context.status_payload, args, payload,
+            registry_path=registry_path)
         observe_quota_result(
             args, payload, registry_path=registry_path, runtime_root=context.runtime_root,
             turn_id=_effective_spend_turn_instance_id(payload, heartbeat_turn_id=heartbeat_turn_id),
@@ -406,7 +413,7 @@ def _emit_quota_result(
             runtime_root=context.runtime_root if context is not None else None)
     activation = None
     if not budgeted_spend:
-        payload, activation = _prepare_quota_result_context(
+        payload, activation, capability_context = _prepare_quota_result_context(
             payload, args, context=context, registry_path=registry_path, heartbeat_turn_id=heartbeat_turn_id,
             capture_directory=capture_directory, reader_argv=reader_argv,
         )
@@ -427,16 +434,33 @@ def _emit_quota_result(
     raw_envelope, legacy_view = False, None
     delivery_request = None
     decision_identity = ("", "")
-    if args.quota_command == "should-run":
-        payload, raw_envelope, legacy_view = compose_quota_cli_source(
-            payload, args, activation, compose=_export("compose_turn_decision"),
-            scheduler_context=context.scheduler_context if context is not None else None,
-            capture_directory=capture_directory,
-        )
-        # Validate before capture or handoff; the complete source is unchanged.
-        payload = _project_quota_cli_payload(payload, args, detail_sections)
     native_context = context_delivery_enabled and bool(getattr(args, "codex_context_dir", None) or getattr(args, "codex_context_root", None))
     try:
+        if args.quota_command == "should-run":
+            from ..control_plane.effect_runtime import EffectRuntimeRemoteError, EffectRuntimeStartupError
+
+            try:
+                payload, raw_envelope, legacy_view = compose_quota_cli_source(
+                    payload, args, activation, compose=_export("compose_turn_decision"),
+                    scheduler_context=context.scheduler_context if context is not None else None,
+                    capture_directory=capture_directory, capability_context=capability_context,
+                )
+            except (EffectRuntimeRemoteError, EffectRuntimeStartupError) as exc:
+                # An uncomposed input has no current contract binding. Saving
+                # it as a successful root would let recovery misidentify it as
+                # a historical decision and publish an implicit claim source.
+                report = _export("quota_decision_transport_failure_payload")
+                failure = report(args, payload, exc, capture_directory=None)
+                if capture_directory is not None:
+                    digest = capture_decision(capture_directory, {**failure, "source_diagnostic": payload,
+                        "composition_error": {"type": type(exc).__name__, "message": str(exc),
+                            "diagnostic_code": exc.diagnostic_code}})
+                    failure = report(args, payload, exc, capture_directory=capture_directory,
+                        capture_sha256=digest)
+                print_payload(failure, args.format, _quota_renderer(args))
+                return 1
+            # Validate before capture or handoff; the complete source is unchanged.
+            payload = _project_quota_cli_payload(payload, args, detail_sections)
         captured_digest = capture_decision(capture_directory, payload, args=args, native_context=native_context)
         if getattr(args, "prepared_capture_reference", False) and payload.get("ok") is True:
             assert captured_digest is not None  # Preflight requires an explicit capture directory.

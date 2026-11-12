@@ -218,12 +218,15 @@ def assert_explore_entry_and_writer(source, entry, writer):
 
 @pytest.mark.parametrize("provider", ["file", "sqlite"])
 @pytest.mark.parametrize("replan", [True, False])
-@pytest.mark.parametrize("context_delivery", [False, True])
-def test_checkpoint_preflight_delivers_the_real_cli_view_and_retains_full_source(tmp_path, monkeypatch, provider, replan, context_delivery):
+@pytest.mark.parametrize(("context_delivery", "turn_envelope"), [
+    (False, False), (False, True), (True, False), (True, True),
+])
+def test_checkpoint_preflight_delivers_the_real_cli_view_and_retains_full_source(
+        tmp_path, monkeypatch, provider, replan, context_delivery, turn_envelope):
     """Exercise the production preflight without a model or evaluator.
 
-    The production preflight must deliver the complete immutable decision to
-    both model transport and checkpoint selection without a second admission.
+    Model transport must honor the display request, while the checkpoint
+    selector reads the complete immutable decision from the same admission.
     """
     from benchmark.runtime import checkpoint
 
@@ -244,7 +247,7 @@ def test_checkpoint_preflight_delivers_the_real_cli_view_and_retains_full_source
         "LOOPX_CHECKPOINT_REQUEST": str(request), "LOOPX_WAKE_LOG_DIR": str(wake.parent),
         "LOOPX_PROJECT": str(fixture["project"]), "LOOPX_RUNTIME_ROOT": str(fixture["runtime"]),
         "LOOPX_REGISTRY": str(fixture["registry"]), "LOOPX_GOAL_ID": GOAL, "LOOPX_AGENT_ID": AGENT,
-        "LOOPX_TURN_ENVELOPE": "0"}
+        "LOOPX_TURN_ENVELOPE": str(int(turn_envelope))}
     if context_delivery:
         native = tmp_path / "native-context"
         native.mkdir(mode=0o700)
@@ -263,9 +266,10 @@ def test_checkpoint_preflight_delivers_the_real_cli_view_and_retains_full_source
         return run(command, **kwargs)
     monkeypatch.setattr(checkpoint.subprocess, "run", observe)
     receipt = {"turn_id": TURN, "mode": "heartbeat", "stage": "execute"}
+    legacy_view = turn_envelope and not context_delivery
     try:
         body = checkpoint.capture_before_replan(env, receipt, "original heartbeat instructions")
-        assert len(commands) == 1 and "--turn-envelope" not in commands[0]
+        assert len(commands) == 1
         source_path, view_path = wake / "checkpoint-start-guard.json", wake / "checkpoint-start-view.json"
         if context_delivery:
             assert "--prepared-capture-reference" in commands[0]
@@ -274,11 +278,22 @@ def test_checkpoint_preflight_delivers_the_real_cli_view_and_retains_full_source
             assert view_path.parent != wake and view_path.is_relative_to(wake)
             capture = Path(commands[0][commands[0].index("--decision-output-dir") + 1])
             assert view_path == capture / "decision.json"
+            capture_root = capture.parent
         else:
-            assert "--decision-output-root" in commands[0]
+            capture_root = Path(commands[0][commands[0].index("--decision-output-root") + 1])
+        [captured] = capture_root.glob("decision-*/decision.json")
         raw = source_path.read_bytes()
         source, view = json.loads(raw), json.loads(view_path.read_bytes())
-        assert view_path.read_bytes() == raw
+        assert captured.read_bytes() == raw
+        if legacy_view:
+            assert view["schema_version"] == "loopx_turn_envelope_v0"
+            assert view["action_signature"]["matches"] is True
+            assert view["action_signature"]["source_decision_hash"] == source["contract_binding"]["content_hash"]
+            assert shlex.split(view["detail_ref"]["full_decision"]) == ["cat", "--", str(captured)]
+            assert "follow its action, required reads and settlement instructions" in body
+        else:
+            assert view_path.read_bytes() == raw
+        assert ("--turn-envelope" in commands[0]) is legacy_view
         assert str(view_path) in body and str(source_path) not in body
         assert body.endswith("original heartbeat instructions")
         if context_delivery:
@@ -309,8 +324,8 @@ def test_checkpoint_preflight_delivers_the_real_cli_view_and_retains_full_source
             else:
                 assert len(delivered) == 1 and delivered[0]["full_source"] is True
                 assert delivered[0]["text"] == fixture["state"].read_text()
-            # The complete-source checkpoint now starts with its pinned read,
-            # avoiding a presentation-only tool call before required context.
+            # The first tool returns required facts directly. Replan may stage
+            # the opening before SessionStart while pinning the original source.
             command = body.split("```sh\n", 1)[1].split("\n```", 1)[0]
             projected = run(shlex.split(command), cwd=fixture["project"], env=env,
                 capture_output=True, text=True, timeout=60)
@@ -321,8 +336,28 @@ def test_checkpoint_preflight_delivers_the_real_cli_view_and_retains_full_source
 
             reference = presentation["reference_file"]
             _, metadata = read_context_read_reference(Path(reference))
-            assert metadata["path"] == str(view_path)
-            assert metadata["sha256"] == hashlib.sha256(view_path.read_bytes()).hexdigest()
+            presentation_path = Path(metadata["path"])
+            presentation_bytes = presentation_path.read_bytes()
+            assert metadata["sha256"] == hashlib.sha256(presentation_bytes).hexdigest()
+            added = {}
+            if replan:
+                assert presentation["navigation"]["mode"] == "full"
+                assert "baseline_reference" not in presentation["navigation"]
+                assert presentation_path.is_relative_to(native.resolve())
+                staged = json.loads(presentation_bytes)
+                staged_packet = staged["replan_action_packet"]
+                for stage in ("review", "writeback"):
+                    argv = shlex.split(staged_packet[stage])
+                    assert argv[argv.index("--decision-file") + 1] == str(view_path)
+                    assert argv[argv.index("--source-hash") + 1] == source["contract_binding"]["content_hash"]
+                detail = shlex.split(staged["context_details"]["command_template"])
+                assert Path(detail[detail.index("--capture-file") + 1]).read_bytes() == raw
+                assert detail[detail.index("--capture-sha256") + 1] == hashlib.sha256(raw).hexdigest()
+                added = {"/replan_action_packet/review": staged_packet["review"],
+                         "/replan_action_packet/guidance": staged_packet["guidance"],
+                         "/context_details": staged["context_details"]}
+            else:
+                assert presentation_path == view_path and presentation_bytes == raw
             chunks, offset = [], 0
             while True:
                 assert presentation["offset"] == offset
@@ -342,22 +377,26 @@ def test_checkpoint_preflight_delivers_the_real_cli_view_and_retains_full_source
             selected = json.loads(selected_body)
             assert selected["schema_version"] == "context_capture_selection_v1"
             pointers = [row["pointer"] for row in selected["selections"]]
+            assert added.keys() <= set(pointers)
             for required in ["/goal_boundary", "/heartbeat_receipt", "/execution_obligation"]:
                 assert any(required == pointer or required.startswith(pointer + "/") or pointer == ""
                            for pointer in pointers), (required, pointers)
             for row in selected["selections"]:
+                if row["pointer"] in added:
+                    assert row["value"] == added[row["pointer"]]
+                    continue
                 expected = source
                 for token in row["pointer"].split("/")[1:]:
                     token = token.replace("~1", "/").replace("~0", "~")
                     expected = expected[int(token)] if isinstance(expected, list) else expected[token]
                 assert row["value"] == expected
-        assert source_path.read_bytes() == view_path.read_bytes() == raw
+        assert source_path.read_bytes() == captured.read_bytes() == raw
         assert source["schema_version"] == "loopx_turn_envelope_v1"
-        assert view == source  # The checkpoint sends one complete source, not a second fact lens.
+        if not legacy_view:
+            assert view == source
         assert source["heartbeat_receipt"]["turn_instance_id"] == TURN
-        assert source["heartbeat_receipt"] == view["heartbeat_receipt"]
         assert receipt["checkpoint"]["reason"] == "synthetic_no_native_capture"
-        selection = view["interaction_contract"]["cli_channel"].get("selection_command")
+        selection = source["interaction_contract"]["cli_channel"].get("selection_command")
         if selection:
             assert "--decision-output-root" in selection["command_args_template"]
         if context_delivery and replan:
@@ -366,21 +405,19 @@ def test_checkpoint_preflight_delivers_the_real_cli_view_and_retains_full_source
             assert followup[followup.index("--context-delivery") + 1] == "on"
             assert followup[followup.index("--codex-context-dir") + 1] == str(native)
             assert "--decision-output-dir" not in followup and "--prepared-capture-reference" not in followup
-        selector = checkpoint.effect_runtime_result("runtime.checkpoint_artifacts", {
-            "action": "select_replan", "quota": source, "goal_id": GOAL, "agent_id": AGENT,
-            "turn_instance_id": TURN}, large_local_snapshot=True)
+        selector = checkpoint.select_checkpoint_replan(source, goal_id=GOAL, agent_id=AGENT, turn_instance_id=TURN)
         assert selector["capture"] is replan
         if not replan:
-            assert "result_writeback_read" not in explore_source(view)["content"]["graph"]
-            assert "replan_action_packet" not in view
+            assert "result_writeback_read" not in explore_source(source)["content"]["graph"]
+            assert view.get("replan_action_packet") is None
             return
         assert source["autonomous_replan_obligation"]["replan_context"]["context_id"]
-        assert view["autonomous_replan_obligation"]["replan_context"] == source["autonomous_replan_obligation"]["replan_context"]
-        assert view["replan_action_packet"]["planning_guidance"] == source["replan_action_packet"]["planning_guidance"]
-        assert view["replan_action_packet"]["writeback_contract"] == source["replan_action_packet"]["writeback_contract"]
-        # Historical staged consumers still use the original hash-bound reads.
-        # This does not qualify their discoverability in the complete CLI input.
-        packet = build_turn_envelope(source)["replan_action_packet"]
+        if context_delivery:
+            packet = staged_packet
+        elif legacy_view:
+            packet = view["replan_action_packet"]
+        else:
+            packet = build_turn_envelope(source)["replan_action_packet"]
         capture = Path(source["replan_read_path"])
         assert capture.read_bytes() == source_path.read_bytes()
         before = {key: fixture[key].read_bytes() for key in ("registry", "state", "index")}
@@ -390,11 +427,12 @@ def test_checkpoint_preflight_delivers_the_real_cli_view_and_retains_full_source
             read = json.loads(result.stdout)
             assert read["obligation_id"] == selector["obligation_id"]
             assert read["stage"] == stage
+            if stage == "review":
+                assert read["planning_guidance"] == source["replan_action_packet"]["planning_guidance"]
             if stage == "writeback":
                 # Complete delivery preserves original capability authoring;
                 # the old writer still supplies the exact applicable attachment.
                 original = explore_source(source)["content"]["graph"]
-                assert explore_source(view)["content"]["graph"] == original
                 plan = read["writeback"].get("settlement_plan", {})
                 steps = plan.get("ordered_steps", [])
                 attachments = [attachment for step in steps
@@ -422,12 +460,19 @@ def test_checkpoint_preflight_delivers_the_real_cli_view_and_retains_full_source
         assert {key: fixture[key].read_bytes() for key in before} == before
         assert capture.read_bytes() == source_path.read_bytes()
         assert len(commands) == 1  # Reads did not re-enter checkpoint preflight.
-        if context_delivery:
+        if context_delivery or legacy_view:
+            followup = shlex.split(selection["command_args_template"])
+            if legacy_view:
+                assert "--turn-envelope" in followup
+                assert followup[followup.index("--context-delivery") + 1] == "off"
             selected = shlex.split(selection["route_prefix"]) + followup
             selected[selected.index("{todo_id}")] = TODO
-            result = run(selected, cwd=fixture["project"], env=env, capture_output=True, text=True, timeout=60)
+            selection_env = {**env, "LOOPX_CONTEXT_DELIVERY": "on"} if legacy_view else env
+            result = run(selected, cwd=fixture["project"], env=selection_env, capture_output=True, text=True, timeout=60)
             assert result.returncode == 0, result.stdout
-            [next_capture] = set(captured_dir.parent.glob("*/decision.json")) - {capture}
+            if legacy_view:
+                assert json.loads(result.stdout)["schema_version"] == "loopx_turn_envelope_v0"
+            [next_capture] = set(capture_root.glob("*/decision.json")) - {capture}
             identity = json.loads(next_capture.read_bytes())["heartbeat_receipt"]["settlement_identity"]
             assert (identity["todo_id"], identity["turn_instance_id"]) == (TODO, TURN)
             assert capture.read_bytes() == source_path.read_bytes()

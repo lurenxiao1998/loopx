@@ -170,8 +170,16 @@ native projector present full/delta for an uninterrupted tool. A refused/lost
 release remains the original typed transport failure, without publishing an
 optimized result or rerunning the guard. An interrupted guard continues with
 the original full packet; no delta is required for checkpoint recovery. Native
-cursor verification also binds the context-directory/root option. The existing
-Darwin native-checkpoint refusal remains in force.
+cursor verification binds the context-directory/root option and the worker's
+original `--complete-turn` and `--turn-envelope` choices. A checkpoint without
+a complete-mode binding cannot verify a pending command that uses
+`--complete-turn`. Historical ordinary and envelope guards remain readable.
+The existing Darwin native-checkpoint refusal remains in force.
+
+Preflight, live handoff and native checkpoint recovery use the current context
+reader's complete-source validator before selecting a replan point. A matching
+file digest cannot replace validation of the contract it contains. Older
+unversioned quota originals retain their receipt and scope checks.
 
 The host-side checkpoint preflight captures the complete original decision.
 With context delivery enabled, its prompt supplies `quota context-project`
@@ -190,9 +198,13 @@ original full-read reference and receipt; use that explicit reference without
 rerunning admission. An optional cache write after recovery is established can
 still fall back to the same full input. A bad source hash/scope is refused before
 publication. This does not renew decision
-freshness or establish autonomous solver benefit. Default-off preloading is
-unchanged. Include the projection command, descriptor, recovery and page reads
-in subsequent total-cost comparisons.
+freshness or establish autonomous solver benefit. With context delivery off,
+preflight forwards an explicit short-envelope request and pins that choice in
+same-Turn Todo selection. The short view links to the original complete
+capture used by the checkpoint selector. The wake receipt records the
+requested treatment, so check the delivered view when qualifying a comparison.
+Include the projection command, descriptor, recovery and page reads in
+subsequent total-cost comparisons.
 Across distinct worker wakes, settle the prior Turn before selecting new work;
 reading an old prompt from resumed history cannot supply the next wake's guard.
 Do not modify an active/frozen trial. Set `context_delivery: "off"` for a new trial

@@ -8,15 +8,27 @@
 
 [#8480](https://github.com/loopx-project/loopx/pull/8480) 的完整单 Worker EdgeBench 入口与原轮次恢复，
 现已独立提向 main：[#8499](https://github.com/loopx-project/loopx/pull/8499)，23 文件、+493/−119，
-其中 18 个完整文件与 C1 候选逐字一致。获准合入 main 后，C1 可通过集成消除这些重复差异。
+其中 18 个完整文件在 C1 `33a0152376a0` 时逐字一致。获准合入 main 后，C1 可通过集成消除这些重复差异。
 在此之前保留可用 caller 和 [#8484](https://github.com/loopx-project/loopx/pull/8484) 的既有依赖；
 历史实验记录仍放在一起。这次拆分不证明原 quota 成果或完整成本收益。
 
-普通 guided-start 与 visible-Goal 调用保留原来源中 Agent 负责的手动结算；只有既有、
-具备资格的 native publisher 才可展示 runtime 负责的组合步骤。完整 carrier 或渐进展示
+普通 guided-start 与 visible-Goal 调用保留原来源中 Agent 负责的手动结算；具备资格的
+native publisher 和显式完整 Host profile 可展示 runtime 负责的组合步骤。完整 carrier 或渐进展示
 不能选择这一归属。C1 的 5 项 CLI 预期误要求普通调用也组合结算，当前 main 实际回读
 确认应保留手动归属；修正后的测试核对原身份、spend 来源与命令，并验证完整来源，
 不通过改变生产语义来迎合测试。
+
+候选已集成 main `d78064e0c848`，并衔接提案
+[#8489](https://github.com/loopx-project/loopx/pull/8489) 和
+[#8494](https://github.com/loopx-project/loopx/pull/8494)。显式 Host profile 在 capture 前
+使用既有 typed native CLI 结算投影；adapter 只补充六项资格事实，不再复制整份来源。
+该显式 profile 在既有来源组合前增加一次有界投影请求，此处不证明 RPC 或模型成本净收益。
+普通与 checkpoint 预载 worker 共用 `Execution` 解码。完整来源仍只有一个 composer，
+并继续拒绝通过传输参数重写结算归属。写回已验证后，typed 读回也为无 Todo 的 replan
+投影原待扣额 closeout，保留历史 ACK 和一次性结算。C1 原规则继续区分观察到的 review 与
+真正绑定的选择；照搬 main 专用 fallback 会使这些用例回归，故未采用该冲突选择。
+显式 raw-off 保留 v0 视图，渐进交付校验完整 v1 来源。安装态／在途采用、独立评审、
+原 quota 成果及完整成本仍待验收。
 
 当前完整来源 validator 也将可执行必读校验交给既有 interaction owner。显式
 command／ordering 不得消失或引入不支持的执行顺序；纯文字和合法待执行义务保持
@@ -447,12 +459,17 @@ capture 字节改变后拒绝读取，不产生新 admission 或 spend。
 同源 File／SQLite 与长路径证据支持展示预算重新定标，原失败、全部行数／增长／权限
 限制继续保留。这是接受新增内联成本，不是效率收益、installed 采用或 C1 关闭。
 
-Reward Memory 在原生 quota 与完整 Host 路径注册召回与反思时，只读一次已有类型约束
-的能力事实，不再为判定参与资格读取整份 action signature。交付仍受已验证的 Goal/Agent
-绑定、provider 策略和原 Host 来源约束。`capability_context.ts::contextSource` 仍按当前
-工作和结算为原生 quota 的贡献绑定签名；退役这条活跃路径时须同时保留注册、回读和原版本
-恢复。共享能力命名空间保护将 `work_contract` 与 `source_decision_hash` 保留给核心，
-覆盖注册、上下文及可选结果字段；贡献被拒绝后，原 Host 来源仍可用。
+Reward Memory 从已有类型约束的能力事实判断是否参与召回和反思，并遵守已验证的
+Goal/Agent 绑定及 provider 策略。原生 quota 在组合完整 Turn 前校验可选建议和回读槽位。
+校验后的建议暂存在本次组合中，随同一份原始来源一起封存。读回时先验证完整来源，
+再从中取得建议和对应的槽位。这移除了正常原生 quota 为可选建议单独计算的旧动作签名。
+未封存的草稿无法投影为建议，也无法当作历史建议重新组合。
+
+完整 Host 仍用已验证的 Turn 与来源摘要绑定其工作契约之外的建议。带有 `basis_digest`
+的既有 quota 贡献继续按原版本读回，并核对原绑定。要退役该 reader，需先对清最后一批
+受支持的捕获及其恢复窗口。两条路径复用注册、槽位、大小和命名空间校验，
+`contract_binding` 与 `turn_context_contributions` 由核心保留。可选建议被拒绝后，
+原工作来源仍可用。
 
 可选 Host 投影现已把有序合并、冲突拒绝和逐贡献隔离收敛到该 TypeScript owner。
 Python 只提取一次当前来源并发送一个批次，provider 结果及历史 capture／journal reader
@@ -460,8 +477,8 @@ Python 只提取一次当前来源并发送一个批次，provider 结果及历�
 按 File／SQLite 对照零／一／两个 provider、当前／历史来源及接近大小上限的输入，
 投影建议保持一致。在这一有界步骤中，两个 provider 的完整来源 RPC 从四次降为两次。
 大批次复用现有私有快照运输，增加临时 IO，且实测在接近上限时变慢；仅扩展运输可接受
-范围，不提高 provider 预算。这不构成模型 token、整任务成本或已验收成果收益结论。
-原生 quota 签名退役、installed 采用和相对原 quota 的资格验证仍未完成。
+范围，不提高 provider 预算。这组对照覆盖上述投影步骤。installed 采用、相对原 quota
+的成果和完整成本对照仍待验证。
 
 [可选上下文来源的 main 后续修复](https://github.com/loopx-project/loopx/pull/8455)
 让仅状态回读不依赖可执行来源提取，同时使声明了完整版本的 native 来源在参与事实或
@@ -469,7 +486,7 @@ Python 只提取一次当前来源并发送一个批次，provider 结果及历�
 不得回退到 raw quota 签名。召回观察与签名的治理 payload 分开传递，不能仅为附上 provider
 读回而改写来源。注册、命名空间、槽位和大小检查保留；有效指导与记录中的 Host 包装仍用
 原绑定和规范结算，无效来源保留状态观察但不能交付指导。这增加完整 native 来源验证。
-早期仅状态路径的 RPC 减少不证明模型窗口或整任务收益，native 签名退役仍未完成。
+早期的 RPC 对照覆盖仅状态回读路径。
 
 集成 main `5988be01` 保留共享的静默完成规则，没有恢复已退役的另一套 heartbeat
 正文。该检查点的长 scope thin 与完整能力 CLI 夹具超过原 5,100 展示预算，捕获长
@@ -611,6 +628,16 @@ Turn key。所选 Todo 的 required capabilities 一旦变化，即使旧 action
 Host 输入、缓存结果的任务校验和结算都使用日志里的原计划。日志里已校验的结果仍能按
 历史绑定读取原有受限结果 schema。新调用 Host 时，建议须通过完整绑定校验。
 普通 quota 与历史 v0 继续使用各自已有的 decoder。
+
+完整 Host 请求重试失败 Turn 时，只读取经校验的 Goal、Agent 及 Todo 或带范围的
+结算绑定。重试沿用日志里的 Turn key，匹配 Session 时不再返回或重算完整 action
+的哈希。新计划仍在生成 key 前规整 adaptive primary，并使用原有数字编码。旧格式
+及混合格式 reader 保留到未结工作及受支持的恢复窗口核清。
+升级验证用 File 和 SQLite 各恢复了两种原 writer 格式。Agent 不匹配、Session 缺失
+或 capture 被改动均在调用 Host 或扣额度前拒绝。有效重试续回原 Session，只结算一次；
+再次重放没有新效果。两份完整格式样本的 Session 匹配响应分别由 10,692 和 10,738
+字节降至 130 字节。这仅衡量此内部边界的序列化响应，未衡量 RPC 次数、模型 token
+或匹配任务的完整成本。
 
 现代 Codex 与结构化 Host 指令共用既有 audit 读取规则：在判断 Goal acceptance 或提出
 closeout 前读取已声明 audit，即使 Goal 保持开放。通知策略不授予或取消执行权；所供

@@ -23,6 +23,7 @@ from datetime import datetime
 from ...chat import (
     CHAT_REVIEW_OPEN_TAG, CHAT_REVIEW_CLOSE_TAG,
     VisibleResponseStreamFilter,
+    _review_openings,
     parse_agent_response,
 )
 from ...chat_agent import CodexChatAgentError, _turn_prompt
@@ -100,6 +101,45 @@ def _observed_turn_steps(steps: list[Any], start: int, total: int) -> tuple[list
     return current, base + len(steps)
 
 
+_RUNNING_STEP_BODIES = {
+    "CORTEX_STEP_TYPE_PLANNER_RESPONSE": "plannerResponse",
+    "CORTEX_STEP_TYPE_RUN_COMMAND": "runCommand",
+    "CORTEX_STEP_TYPE_VIEW_FILE": "viewFile",
+    "CORTEX_STEP_TYPE_CODE_ACTION": "codeAction",
+    "CORTEX_STEP_TYPE_ERROR_MESSAGE": "errorMessage",
+}
+
+
+def _running_snapshot_steps(snapshot: dict[str, Any], *, cascade_id: str, start: int,
+                            total: int, sent_prompt: str) -> list[tuple[int, dict[str, Any]]] | None:
+    """Reuse a complete running snapshot only for the input this adapter sent."""
+    trajectory = snapshot.get("trajectory")
+    if (snapshot.get("status") != "CASCADE_RUN_STATUS_RUNNING" or not isinstance(trajectory, dict)
+            or trajectory.get("cascadeId") != cascade_id):
+        return None
+    raw = trajectory.get("steps")
+    if not isinstance(raw, list) or len(raw) != total:
+        return None
+    try:
+        indexed, covered = _observed_turn_steps(raw, start, total)
+        if covered != total or not indexed:
+            return None
+        first = indexed[0][1]
+        if (first.get("type") != "CORTEX_STEP_TYPE_USER_INPUT"
+                or _native_user_input_text(first) != sent_prompt):
+            return None
+        for _, step in indexed:
+            kind = step.get("type")
+            if not isinstance(kind, str) or not isinstance(step.get("status"), str):
+                return None
+            body = _RUNNING_STEP_BODIES.get(kind)
+            if body and (not isinstance(step.get(body), dict) or not step[body]):
+                return None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return indexed
+
+
 def _check_hard_timeout(value: float | None) -> None:
     if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
         raise ValueError("Antigravity hard timeout must be finite and positive")
@@ -124,6 +164,21 @@ def _native_completion_facts(cascade_id: str, current: list[tuple[int, dict[str,
         facts.append(fact)
     return {"thread_id": cascade_id, "start_step_index": current[0][0],
         "total_steps": current[-1][0] + 1, "steps": facts}
+
+
+def _parse_native_final_response(raw: str, *, work_dir: Path,
+                                 team_plan_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Parse only after the caller verifies this input's normal native final."""
+    parsed = parse_agent_response(raw, protected_paths=[work_dir], team_plan_context=team_plan_context)
+    if not parsed.get("message") and not any(parsed.get(key) for key in
+            ("proposals", "context_handoff", "protected_action", "gate", "goal_draft", "unfinished_work")):
+        # Unlike a generic prefix, this is the verified final planner's prose.
+        # Salvage text only: missing message never opts into compact metadata.
+        openings, _, _ = _review_openings(raw)
+        visible = raw[:openings[0]] if openings else ""
+        if visible.strip():
+            return parse_agent_response(visible, protected_paths=[work_dir], team_plan_context=team_plan_context)
+    return parsed
 
 
 class _LocalRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -716,7 +771,7 @@ class AntigravityAdapter:
                     or planner.get("stopReason") != "STOP_REASON_STOP_PATTERN"
                     or not isinstance(answer, str) or not answer.strip()):
                 return None
-            response = parse_agent_response(answer, protected_paths=[work_dir])
+            response = _parse_native_final_response(answer, work_dir=work_dir)
             if not response.get("message"):
                 return None
             return {"thread_id": cascade_id, "request_ref": request_ref, "execution_id": execution,
@@ -1049,30 +1104,51 @@ class AntigravityAdapter:
             error.native_error_info = {"timeout": detail}
             raise error
 
+        observation_limit = 10.0
+
+        def observe(method: str, args: dict[str, Any],
+                    final_read_deadline: float | None) -> dict[str, Any] | None:
+            remaining = observation_limit
+            if final_read_deadline is not None:
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    timeout("hard")
+                remaining = final_read_deadline - now
+                if remaining <= 0:
+                    timeout("idle")
+            try:
+                return _rpc_post(self.ls_url, self.csrf_token, method,
+                                 {"cascadeId": self.cascade_id, **args}, timeout=remaining)
+            except CodexChatAgentError as exc:
+                if exc.error_code != "antigravity_transport_error":
+                    raise
+                # A missed observation neither resends the input nor refreshes
+                # the clock. The last observation has no transport retry.
+                if final_read_deadline is not None:
+                    self._check_interrupted()
+                    if deadline is not None and time.monotonic() >= deadline:
+                        timeout("hard")
+                    timeout("idle")
+                self._interrupted.wait(1.0)
+                return None
+
         while True:
             now = time.monotonic()
             if deadline is not None and now >= deadline:
                 timeout("hard")
+            self._check_interrupted()
+            final_read_deadline = None
             if now - last_progress_at >= ANTIGRAVITY_IDLE_TIMEOUT_SEC:
-                timeout("idle")
-            self._check_interrupted()
-            self._interrupted.wait(0.25)
-            self._check_interrupted()
-            try:
-                traj = _rpc_post(
-                    self.ls_url,
-                    self.csrf_token,
-                    "GetCascadeTrajectory",
-                    {"cascadeId": self.cascade_id},
-                    timeout=10.0,
-                )
-            except CodexChatAgentError as exc:
-                # Losing an idempotent observation does not mean that the
-                # native invocation failed. Never resend its input, refresh its
-                # progress clock, or bypass the existing stop/deadline checks.
-                if exc.error_code != "antigravity_transport_error":
-                    raise
-                self._interrupted.wait(1.0)
+                # Native work can advance between the last poll and the idle
+                # deadline. Check the same invocation once before cancelling.
+                final_read_deadline = now + observation_limit
+                if deadline is not None:
+                    final_read_deadline = min(final_read_deadline, deadline)
+            else:
+                self._interrupted.wait(0.25)
+                self._check_interrupted()
+            traj = observe("GetCascadeTrajectory", {}, final_read_deadline)
+            if traj is None:
                 continue
             status = str(traj.get("status") or "")
             total_steps = int(traj.get("numTotalSteps") or 0)
@@ -1083,30 +1159,29 @@ class AntigravityAdapter:
             observed_total = total_steps
             if total_steps > start_step_index:
                 self._check_interrupted()
-                try:
-                    steps_resp = _rpc_post(
-                        self.ls_url,
-                        self.csrf_token,
-                        "GetCascadeTrajectorySteps",
-                        {
-                            "cascadeId": self.cascade_id,
-                            "startIndex": start_step_index,
-                            "endIndex": total_steps,
-                        },
-                        timeout=10.0,
+                snapshot_steps = None
+                if final_read_deadline is None:
+                    snapshot_steps = _running_snapshot_steps(
+                        traj, cascade_id=self.cascade_id, start=start_step_index,
+                        total=total_steps, sent_prompt=full_prompt,
                     )
-                except CodexChatAgentError as exc:
-                    if exc.error_code != "antigravity_transport_error":
-                        raise
-                    self._interrupted.wait(1.0)
-                    continue
-                steps = steps_resp.get("steps")
-                try:
-                    if not isinstance(steps, list):
-                        raise ValueError("Antigravity returned no trajectory coverage")
-                    current_steps, observed_total = _observed_turn_steps(steps, start_step_index, total_steps)
-                except (AttributeError, TypeError, ValueError) as exc:
-                    raise CodexChatAgentError(str(exc), gate=None, error_code="antigravity_rpc_error") from exc
+                if snapshot_steps is not None:
+                    current_steps = snapshot_steps
+                else:
+                    # Older and incomplete snapshots use the detailed read.
+                    # Keep that proof for the idle boundary and final answer.
+                    steps_resp = observe("GetCascadeTrajectorySteps", {
+                        "startIndex": start_step_index, "endIndex": total_steps,
+                    }, final_read_deadline)
+                    if steps_resp is None:
+                        continue
+                    steps = steps_resp.get("steps")
+                    try:
+                        if not isinstance(steps, list):
+                            raise ValueError("Antigravity returned no trajectory coverage")
+                        current_steps, observed_total = _observed_turn_steps(steps, start_step_index, total_steps)
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        raise CodexChatAgentError(str(exc), gate=None, error_code="antigravity_rpc_error") from exc
                 if current_steps:
                     if sum(step.get("type") == "CORTEX_STEP_TYPE_USER_INPUT" for _, step in current_steps) > 1:
                         # Another native input is not this invocation's result or
@@ -1220,10 +1295,17 @@ class AntigravityAdapter:
             self._check_interrupted()
             if deadline is not None and now >= deadline:
                 timeout("hard")
+            idle_expired = (final_read_deadline is not None
+                            and now - last_progress_at >= ANTIGRAVITY_IDLE_TIMEOUT_SEC)
             if saw_running_or_new_step and status == "CASCADE_RUN_STATUS_IDLE" and observed_total == total_steps:
                 final = current_steps[-1][1] if current_steps else {}
-                if final.get("type") == "CORTEX_STEP_TYPE_ERROR_MESSAGE":
-                    detail = (final.get("errorMessage") or {}).get("error") or {}
+                final_is_error = final.get("type") == "CORTEX_STEP_TYPE_ERROR_MESSAGE"
+                error_message = final.get("errorMessage") or {}
+                cleared_retry = (final_is_error and final.get("status") == "CORTEX_STEP_STATUS_CLEARED"
+                                 and isinstance(error_message, dict)
+                                 and error_message.get("shouldShowUser") is not True)
+                if final_is_error and not cleared_retry:
+                    detail = error_message.get("error") or {}
                     summary = (detail.get("userErrorMessage") or detail.get("shortError")
                                if isinstance(detail, dict) else str(detail))
                     error = CodexChatAgentError(summary or "Antigravity cascade step error",
@@ -1245,15 +1327,18 @@ class AntigravityAdapter:
                     self._active_turn_id = None
                     raise CodexChatAgentError("Antigravity ended with a cancelled step; execution may have occurred.",
                                               gate=None, error_code="upstream_transport_failure")
-                # Native IDLE can occur between input, tool and planner steps.
+                # Native IDLE can occur between input, tool and planner steps,
+                # including after the host clears an error before retrying.
                 # Keep observing this invocation; only a finished answer after
                 # all current work settles can close it. The existing idle and
                 # hard deadlines, permission gates and cancellation still apply.
-                if (planner.get("stopReason") in {None, "STOP_REASON_STOP_PATTERN"}
+                if cleared_retry or (planner.get("stopReason") in {None, "STOP_REASON_STOP_PATTERN"}
                         and (final.get("type") != "CORTEX_STEP_TYPE_PLANNER_RESPONSE" or planner.get("toolCalls")
                         or (planner.get("stopReason") is None and not self._read_only_review)
                         or any(step.get("status") in {"CORTEX_STEP_STATUS_GENERATING", "CORTEX_STEP_STATUS_RUNNING"}
                                for _, step in current_steps))):
+                    if idle_expired:
+                        timeout("idle")
                     continue
                 if self._read_only_review:
                     inputs = [step for _, step in current_steps if step.get("type") == "CORTEX_STEP_TYPE_USER_INPUT"]
@@ -1275,6 +1360,8 @@ class AntigravityAdapter:
                     raise CodexChatAgentError("Antigravity ended without a verified final response; execution may have occurred.",
                                               gate=None, error_code="upstream_transport_failure")
                 break
+            if idle_expired:
+                timeout("idle")
 
         if event_sink is not None:
             # Keep only completion facts and the original input/final text,
@@ -1312,9 +1399,9 @@ class AntigravityAdapter:
             except (TypeError, ValueError) as exc:
                 raise CodexChatAgentError("The format review is incomplete or contains other actions; no actions were admitted.",
                                           gate=None, error_code="host_gate") from exc
-        parsed = parse_agent_response(
+        parsed = _parse_native_final_response(
             latest_response_text,
-            protected_paths=[self.work_dir],
+            work_dir=self.work_dir,
             team_plan_context=self.team_plan_context,
         )
         if event_sink is not None:

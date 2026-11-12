@@ -62,6 +62,134 @@ def test_saved_projection_checks_original_before_any_publication(tmp_path, failu
         assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
 
 
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("route", ["stateless", "native", "delta-only", "raw", "pre-session"])
+def test_saved_complete_quota_projection_rejects_invalid_source_without_legacy_fallback(
+        tmp_path, monkeypatch, provider, route):
+    from tests.control_plane.canonical_authority_fixture import isolate_sqlite_runtime
+    from tests.control_plane.test_quota_settlement_cli import (
+        AGENT_ID, GOAL_ID, TODO_ID, TURN_ID, _heartbeat_receipt_count,
+        _initialize_fixture_authority, _spend_run_count, _write_fixture,
+    )
+    from loopx.control_plane.turn_driver.codex_context import codex_context_hook
+
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_fixture(tmp_path)
+    _initialize_fixture_authority(project, runtime, provider=provider)
+    binding = ["--goal-id", GOAL_ID, "--agent-id", AGENT_ID, "--turn-instance-id", TURN_ID]
+    directory = tmp_path / "capture"
+    code, result = _run_cli(registry, runtime, "quota", "should-run", *binding, "--todo-id", TODO_ID,
+        "--complete-turn", "--context-delivery", "off", "--decision-output-dir", str(directory), cwd=project)
+    assert code == 0, result
+    original = directory / "decision.json"
+    raw = original.read_bytes()
+    signed = json.loads(raw)
+    assert signed["schema_version"] == "loopx_turn_envelope_v1"
+    receipt = signed["heartbeat_receipt"]
+
+    options = ["--context-delivery", "off" if route in {"raw", "delta-only"} else "auto"]
+    if route in {"stateless", "native", "pre-session"}:
+        options += ["--initial-read", "--max-page-output-bytes", "12000"]
+    journal = tmp_path / "native"
+    session = "source-validation"
+    event = {"hook_event_name": "SessionStart", "session_id": session, "cwd": str(project)}
+    active_native = route in {"native", "delta-only"}
+    if route in {"native", "delta-only", "pre-session"}:
+        journal.mkdir(mode=0o700)
+        monkeypatch.setenv("CODEX_THREAD_ID", session)
+        if active_native:
+            codex_context_hook(str(journal), {**event, "source": "startup"})
+        options += ["--codex-app", "--codex-context-dir", str(journal)]
+    if route == "delta-only":
+        options += ["--delta-delivery", "auto"]
+
+    def project_capture(path, *, turn=TURN_ID, goal=GOAL_ID, agent=AGENT_ID, digest=None, delivery=options):
+        return _run_cli(registry, runtime, "quota", "context-project", "--goal-id", goal, "--agent-id", agent,
+            "--turn-instance-id", turn, *delivery, "--capture-file", str(path),
+            "--capture-sha256", digest or hashlib.sha256(path.read_bytes()).hexdigest(), cwd=project)
+
+    lookup = ("quota", "context-read", "--codex-context-dir", str(journal),
+        "--goal-id", GOAL_ID, "--agent-id", AGENT_ID, "--select", "/heartbeat_receipt")
+    prior_turn = "preceding-turn"
+    prior_receipt = {"turn_instance_id": prior_turn}
+    prior = directory / "preceding.json"
+    prior_bytes = json.dumps({"ok": True, "goal_id": GOAL_ID, "agent_identity": {"agent_id": AGENT_ID},
+        "heartbeat_receipt": prior_receipt, "requirement": "This requirement belongs to the preceding Turn."}).encode()
+    if active_native:
+        prior.write_bytes(prior_bytes)
+
+    def assert_preceding_recovery():
+        code, page = _run_cli(registry, runtime, *lookup, cwd=project)
+        assert code == 0 and page["eof"], page
+        assert json.loads(page["content"])["selections"] == [
+            {"pointer": "/heartbeat_receipt", "value": prior_receipt},
+        ]
+
+    code, valid = project_capture(original)
+    assert code == 0 and valid["ok"], valid
+    for version, reason in (
+        ("loopx_turn_envelope_v2", "Unsupported"), ("loopx_turn_envelope_v0", "mixed"),
+        (None, "Unsupported"), ("loopx_turn_envelope_v1", "integrity mismatch"),
+    ):
+        bad = {**signed, "schema_version": version}
+        if version is None:
+            del bad["schema_version"]  # The retained binding cannot become an unversioned packet.
+        elif version == "loopx_turn_envelope_v1":
+            bad["contract_binding"] = {**signed["contract_binding"], "content_hash": "sha256:" + "0" * 64}
+        capture = directory / "rejected.json"
+        capture.write_text(json.dumps(bad))
+        digest = hashlib.sha256(capture.read_bytes()).hexdigest()
+        if active_native:
+            code, preceding = project_capture(prior, turn=prior_turn,
+                delivery=[arg for arg in options if arg != "--initial-read"])
+            assert code == 0 and preceding["ok"], preceding
+            assert_preceding_recovery()
+            if version == "loopx_turn_envelope_v2":
+                assert project_capture(capture, digest="0" * 64)[0] == 1
+                assert project_capture(capture, turn=prior_turn)[0] == 1
+                disabled = ["--context-delivery", "off", "--delta-delivery", "off",
+                    "--codex-app", "--codex-context-dir", str(journal)]
+                assert project_capture(capture, delivery=disabled)[0] == 1
+                with monkeypatch.context() as other:
+                    other.setenv("CODEX_THREAD_ID", "different-session")
+                    assert project_capture(capture)[0] == 1
+            if version in {"loopx_turn_envelope_v2", "loopx_turn_envelope_v1"}:
+                foreign = directory / "foreign.json"
+                foreign.write_text(json.dumps({**bad, "goal_id": "different-goal"}))
+                assert project_capture(foreign, goal="different-goal")[0] == 1
+                foreign.write_text(json.dumps({**bad, "agent_identity": {"agent_id": "different-agent"}}))
+                assert project_capture(foreign, agent="different-agent")[0] == 1
+                assert_preceding_recovery()
+        code, rejected = project_capture(capture)
+        assert code == 1 and rejected["ok"] is False, rejected
+        assert rejected["error_code"] == "quota_decision_transport_failed" and reason in rejected["reason"]
+        assert "content" not in rejected and "first_read_command" not in rejected
+        assert rejected["heartbeat_receipt"] == receipt
+        assert rejected["recovery"]["path"] == str(capture) and rejected["recovery"]["sha256"] == digest
+        recovery = shlex.split(rejected["recovery"]["command"])
+        assert "--list" not in recovery and "--initial-read" not in recovery
+        assert "diagnostic" in rejected["instruction"] and "retry context-project" in rejected["instruction"]
+        rc, page = _run_cli(registry, runtime, *recovery[recovery.index("quota"):], cwd=project)
+        assert rc == 0 and page["eof"]
+        assert json.loads(page["content"])["selections"] == [{"pointer": "/heartbeat_receipt", "value": receipt}]
+        if active_native:
+            code, implicit = _run_cli(registry, runtime, *lookup, cwd=project)
+            assert code == 1 and implicit["ok"] is False, implicit
+            assert not codex_context_hook(str(journal), {**event, "source": "compact"})
+    journal_state = journal / "session.json"
+    if active_native:
+        state = json.loads(journal_state.read_text())
+        assert "recovery" not in state and "pending" not in state
+        code, explicit = _run_cli(registry, runtime, "quota", "context-read",
+            "--capture-file", str(prior), "--capture-sha256", hashlib.sha256(prior_bytes).hexdigest(), cwd=project)
+        assert code == 0 and explicit["content"].encode() == prior_bytes
+        assert project_capture(original)[0] == 0
+    else:
+        assert not journal_state.exists()
+    assert original.read_bytes() == raw
+    assert _heartbeat_receipt_count(runtime, TURN_ID) == 1 and _spend_run_count(runtime) == 0
+
+
 @pytest.mark.parametrize("root_kind", ["unsafe", "symlink", "missing_parent"])
 @pytest.mark.parametrize(("opening_args", "recovery_limit"), [
     ([], 64000), (["--initial-read"], 64000),
@@ -396,7 +524,7 @@ def test_saved_projection_recovery_failure_returns_typed_error_and_current_refer
     assert not registry.exists() and not runtime.exists()
 
 
-def test_preflight_instruction_pins_both_projection_and_full_fallback(tmp_path):
+def test_preflight_instruction_pins_projection_and_diagnostic_receipt(tmp_path):
     from benchmark.runtime.context_delivery import preflight_context_instruction
     from loopx.control_plane.turn_driver.decision_capture import CONTEXT_CAPTURE_NAVIGATION_GUIDANCE
 
@@ -418,6 +546,9 @@ def test_preflight_instruction_pins_both_projection_and_full_fallback(tmp_path):
     assert commands[0][commands[0].index("--turn-instance-id") + 1] == "original-turn"
     assert "--initial-read" in commands[0]
     assert "--decision-output-root" not in commands[0]
+    assert commands[1][commands[1].index("--select") + 1:] == ["/heartbeat_receipt"]
+    assert "--list" not in commands[1]
+    assert "retry the same context-project" in body
 
 
 @pytest.mark.parametrize("provider", ["file", "sqlite"])
@@ -605,13 +736,13 @@ def test_checkpoint_preflight_selection_inherits_native_transport(tmp_path, monk
 def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, monkeypatch, host):
     from canonical_authority_fixture import initialize_canonical_authority, isolate_sqlite_runtime, read_fixture_todos
     from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
-    from loopx.control_plane.quota.turn_envelope import prepare_context_delivery, restore_context_delivery
+    from loopx.control_plane.quota.turn_envelope import assert_complete_turn_decision, restore_context_delivery
+    from loopx.control_plane.turn_driver.decision_capture import read_context_capture_file
     from tests.control_plane.codex_checkpoint_fixture import (
-        last_context_page, local_inference_provider, native_process_continuation,
+        delivered_context, last_context_page, local_inference_provider, native_process_continuation,
         selected_context_values,
     )
     from tests.control_plane.test_codex_context_boundary import _app_server, _configure_provider, _native_fixture, _input_text
-    from tests.control_plane.test_codex_context_capture import _delivered
     from tests.control_plane.test_quota_settlement_cli import (
         AGENT_ID, GOAL_ID, TODO_ID, _configure_selectable_alternative,
         _write_fixture, _spend_run_count, _heartbeat_receipt_count,
@@ -641,16 +772,35 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
         build_todo_runtime_shadow_projection(goal_id=GOAL_ID, todos=todos, handoff_mode="soft_claim"),
         state_path=state, provider="sqlite")
     sources = []
+    guard = ("quota", "should-run", "--goal-id", GOAL_ID, "--agent-id", AGENT_ID,
+        "--todo-id", TODO_ID, "--turn-instance-id", "saved-native-turn", "--codex-app")
     for name in (() if benchmark else ("cold", "warm")):
-        code, decision = _run_cli(registry, runtime, "quota", "should-run", "--goal-id", GOAL_ID,
-            "--agent-id", AGENT_ID, "--todo-id", TODO_ID, "--turn-instance-id", "saved-native-turn", "--codex-app", cwd=project)
-        assert code == 0, decision
         if large_capture:
-            # Unknown supporting fields are part of the saved capture's
-            # forward-compatible lossless contract. Only the requested field
-            # should enter model input; the full material must remain recoverable.
-            decision["retained_material"] = {
-                "requirement": unicode_requirement, "supporting": supporting_material}
+            from contextlib import redirect_stdout
+            from io import StringIO
+
+            from loopx.cli import main
+            from loopx.cli_commands import quota
+
+            prepare = quota._prepare_quota_result_context
+
+            def prepare_large_source(payload, *args, **kwargs):
+                # The actual producer must bind the optional material into
+                # its decision before the test saves the original capture.
+                return prepare({**payload, "retained_material": {
+                    "requirement": unicode_requirement, "supporting": supporting_material}},
+                    *args, **kwargs)
+
+            output = StringIO()
+            with monkeypatch.context() as fixture_patch, redirect_stdout(output):
+                fixture_patch.chdir(project)
+                fixture_patch.setattr(quota, "_prepare_quota_result_context", prepare_large_source)
+                code = main(["--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+                    *guard, "--context-delivery", "off"])
+            decision = json.loads(output.getvalue())
+        else:
+            code, decision = _run_cli(registry, runtime, *guard, cwd=project)
+        assert code == 0, decision
         source = workspace / (name + "-source.json")
         source.write_text(json.dumps(decision, ensure_ascii=False))
         if large_capture:
@@ -874,7 +1024,7 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
                         assert page["next_offset"] > page["offset"] and page["next_command"]
                         queue.append(page["next_command"])
                         return response(request, number, message)
-                    assert _delivered(request, descriptor["sha256"]) == Path(descriptor["path"]).read_text().rstrip("\n")
+                    assert delivered_context(request, descriptor["sha256"]) == Path(descriptor["path"]).read_text().rstrip("\n")
                 if benchmark and name in ("cold", "warm"):
                     # Consume the command actually delivered to the native
                     # worker, rather than manually supplying missing flags.
@@ -928,7 +1078,7 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
             errors.append(error)
             return message
 
-    with local_inference_provider(response) as (url, _, _):
+    with local_inference_provider(response) as (url, _, provider_requests):
         if benchmark:
             from benchmark.runtime.worker import run_once
             skills = workspace / "skills"
@@ -976,6 +1126,9 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
                 config.write_text(config.read_text().replace("[features]\n", "[features]\ncode_mode=true\n"))
             _app_server(binary, env, workspace, home, True, sandbox="workspace-write")
     assert not errors and phase == "done", (errors, phase, wrong_runtime.exists())
+    if large_capture:
+        assert all("资料🙂" not in json.dumps(request["input"], ensure_ascii=False)
+            for request in provider_requests)
     if force_async:
         assert async_observed and read_gate.is_file()
     if routed_program:
@@ -989,53 +1142,83 @@ def test_native_saved_preflight_uses_lifecycle_without_guard_replay(tmp_path, mo
         assert _spend_run_count(runtime) == 1  # only the explicit inter-wake settlement above
     else:
         assert _heartbeat_receipt_count(runtime, "saved-native-turn") == receipts and _spend_run_count(runtime) == 0
+    def checked_body(reference):
+        return read_context_capture_file(reference["path"], reference["sha256"], private=True)[2]
+
     cold = observed["cold"][0]
-    baseline = None
-    for published, descriptor in observed.values():
-        projected = json.loads(Path(descriptor["recovery"]["path"]).read_text())
+    previous = None
+    signed_sources = {}
+    for name, (published, descriptor) in observed.items():
+        projected = checked_body(descriptor["recovery"])
+        if projected.get("schema_version") == "loopx_turn_envelope_v1":
+            details = projected.get("context_details", {})
+            reference = details.get("unread_context_index", {}).get("source")
+            if reference is None and (reader := details.get("command_template")):
+                argv = shlex.split(reader)
+                reference = {"path": argv[argv.index("--capture-file") + 1],
+                             "sha256": argv[argv.index("--capture-sha256") + 1]}
+            signed = checked_body(reference) if reference else projected
+            assert_complete_turn_decision(signed)
+            assert signed["contract_binding"] == projected["contract_binding"]
+            assert signed["heartbeat_receipt"] == projected["heartbeat_receipt"]
+            signed_sources[name] = signed
         if large_capture:
-            # Oversized inputs use the exact saved document without a delta target.
-            assert descriptor["mode"] == "full" and "target" not in descriptor
+            assert descriptor["mode"] == "full"
+            if "target" in descriptor:
+                assert descriptor["target"]["goal_id"] == GOAL_ID
+                assert descriptor["target"]["agent_id"] == AGENT_ID
             assert published == projected
             assert projected["retained_material"] == {
                 "requirement": unicode_requirement, "supporting": supporting_material}
             continue
-        current = prepare_context_delivery(projected,
-            scope={key: descriptor["target"][key] for key in
-                ("goal_id", "agent_id", "session_id", "context_epoch", "continuity_generation") if key in descriptor["target"]},
-            capture_id=descriptor["target"]["capture_id"],
-            surface="complete_turn" if projected.get("schema_version") == "loopx_turn_envelope_v1" else "quota_packet")
-        # Full presentation publishes the original document; only deltas have
-        # a separate wire target. Both retain the same typed recovery check.
-        wire = current if descriptor["mode"] == "full" else published
-        assert current["target"] == descriptor["target"]
-        restored = restore_context_delivery(wire, baseline=baseline, current=current)
-        assert restored["context"] == projected
+        # The pinned full presentation has its own digest and target; a signed
+        # decision authenticates the source, not the transported presentation.
+        current = {"schema_version": "context_delivery_v1", "mode": "full", "target": descriptor["target"],
+                   "ancestry": 0, "context": projected}
+        if descriptor["mode"] == "full":
+            assert published == projected
+            wire, base = current, None
+        else:
+            wire, base = published, previous
+            if wire.get("continuity_basis") == "captured_file":
+                base = {**current, "target": wire["base"], "context": checked_body(descriptor["baseline_reference"])}
+        restored = restore_context_delivery(wire, baseline=base, current=current)
+        assert restored["target"] == descriptor["target"] and restored["context"] == projected
+        assert restored["mode"] == descriptor["mode"]  # Full fallback would hide a broken delta.
         if wire["mode"] == "delta":
-            assert restored["mode"] == "delta"  # A fallback would hide a broken baseline chain.
-        # Match the native journal's exact prior full capture and depth. The
-        # reconstructed mapping need not preserve that capture's field order.
-        baseline = {**current, "ancestry": 0 if wire.get("continuity_basis") == "captured_file" else wire["ancestry"]}
+            corrupted = {**wire, "changes": {"value": {}}}
+            for rejected, candidate in ((wire, None), (corrupted, base)):
+                fallback = restore_context_delivery(rejected, baseline=candidate, current=current)
+                assert fallback["mode"] == "full" and fallback["reason"] == "automatic_full_recovery"
+                assert fallback["target"] == current["target"] and fallback["context"] == projected
+        previous = {**current, "ancestry": 0 if wire.get("continuity_basis") == "captured_file" else wire["ancestry"]}
     if benchmark:
-        for name, (_, raw) in zip(("cold", "warm"), sources):
-            presentation = json.loads(Path(observed[name][1]["recovery"]["path"]).read_text())
+        for name, (source_path, raw) in zip(("cold", "warm"), sources, strict=True):
+            presentation = checked_body(observed[name][1]["recovery"])
             original = json.loads(raw)
+            if original.get("schema_version") == "loopx_turn_envelope_v1":
+                assert signed_sources[name] == original
             selected = presentation["interaction_contract"]["cli_channel"]["selection_command"]
             original_command = original["interaction_contract"]["cli_channel"]["selection_command"]["command_args_template"]
             words = shlex.split(selected["command_args_template"])
             original_words = shlex.split(original_command)
+            output_root = source_path.parents[1] if "--decision-output-root" in original_words else home / "loopx-context"
             transport = {
-                "--decision-output-root": str(home / "loopx-context"),
+                "--decision-output-root": str(output_root),
                 "--context-delivery": "on",
                 "--delta-delivery": "auto",
                 "--codex-context-dir": str(home / "loopx-context"),
                 "--max-page-output-bytes": "32000",
             }
             for option, value in transport.items():
-                assert option not in original_words and words.count(option) == 1
+                assert words.count(option) == 1
                 index = words.index(option)
                 assert words[index + 1] == value
-                del words[index:index + 2]
+                if option in original_words:
+                    assert original_words.count(option) == 1
+                    assert original_words[original_words.index(option) + 1] == value
+                else:
+                    del words[index:index + 2]
             assert words == original_words
             selected["command_args_template"] = original_command
             # Main already deduplicates identical Todo rows within this exact
@@ -1339,6 +1522,44 @@ def test_saved_initial_page_is_primary_and_its_recovery_replays_the_same_selecti
         recipe["command_args_template"] = selection_args
         assert view == json.loads(raw)
     assert not registry.exists() and not runtime.exists()
+
+
+def test_stateless_saved_initial_read_bounds_the_default_cli_output(tmp_path):
+    import subprocess
+
+    requirement = "Preserve the original acceptance and stop. 保留原要求。\n" * 850
+    receipt = {"event_id": "original-receipt", "turn_instance_id": "original-turn"}
+    source = (tmp_path / "original.json").resolve()
+    raw = json.dumps({"ok": True, "goal_id": "g", "agent_identity": {"agent_id": "a"},
+        "heartbeat_receipt": receipt, "effective_action": "normal_run",
+        "interaction_contract": {"schema_version": "loopx_interaction_contract_v0", "agent_channel": {
+            "work_context": {"sources": [{"source": "goal_state", "ordering": "before_work",
+                "content": {"text": requirement, "state_file": "goal.md"}}]}}}}, ensure_ascii=False).encode()
+    source.write_bytes(raw)
+    registry, runtime = tmp_path / "absent-registry.json", tmp_path / "runtime"
+    base = [sys.executable, "-m", "loopx.entrypoint", "--registry", str(registry),
+        "--runtime-root", str(runtime), "--format", "json"]
+    argv = ["quota", "context-project", "--context-delivery", "auto", "--delta-delivery", "off",
+        "--initial-read", "--capture-file", str(source), "--capture-sha256", hashlib.sha256(raw).hexdigest(),
+        "--goal-id", "g", "--agent-id", "a", "--turn-instance-id", receipt["turn_instance_id"]]
+    body = bytearray()
+    for _ in range(16):
+        result = subprocess.run([*base, *argv], cwd=tmp_path, capture_output=True, check=True)
+        assert len(result.stdout) <= 12000
+        page = json.loads(result.stdout)
+        assert page["ok"] and page["offset"] == len(body)
+        body.extend(page["content"].encode())
+        if page["eof"]:
+            assert page["total_bytes"] == len(body)
+            break
+        reader = shlex.split(page["next_command"])
+        argv = reader[reader.index("quota"):]
+    else:
+        pytest.fail("stateless first read did not complete within its bounded fixture")
+    chosen = {row["pointer"]: row["value"] for row in json.loads(body)["selections"]}
+    assert chosen["/heartbeat_receipt"] == receipt
+    assert chosen["/interaction_contract/agent_channel/work_context/sources/0/content/text"] == requirement
+    assert source.read_bytes() == raw and not registry.exists() and not (runtime / "goals").exists()
 
 
 def test_attached_selected_page_uses_the_same_window_as_its_reader(tmp_path, monkeypatch):

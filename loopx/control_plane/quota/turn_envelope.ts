@@ -1,7 +1,8 @@
 import {EXECUTION_PREPARATION_SCHEMA_VERSION} from "../work_items/execution_preparation.ts";
 import {capturedContextSelection} from "./context_selection.ts";
 import {contextReadSectionDigests, initialContextReadPointers, prepareProgressiveContext, prepareProgressiveContextDelivery,
-  progressiveContextPlan, successorReplanReadSelection, type ReusableExactBody} from "./progressive_context.ts";
+  progressiveContextPlan, scopedReplanYardstickReversal, successorReplanReadSelection,
+  type PreparationScopeDetail, type ReusableExactBody} from "./progressive_context.ts";
 import type { LoopXTurnRouteValue } from "../turn_driver/turn_contract_generated.ts";
 import { EFFECTIVE_ACTIONS, EffectiveAction, type QuotaEffectiveActionValue } from "./effective_action.generated.ts";
 import { AGENT_SCOPE_FRONTIER_ACTIONS } from "../agents/agent_scope_frontier.generated.ts";
@@ -16,6 +17,7 @@ import {contextProjectionChanges, contextProjectionIdentity, contextProjectionRe
   contextSourceIdentity, projectQuotaDiagnostics, referenceQuotaSummaryLanes, resolveQuotaSummaryLanes,
   type ProjectionSourceValues} from "./diagnostic_projection.ts";
 import {referenceExploreResultDelivery} from "../capabilities/explore_result_writeback.ts";
+import {stagedStrideVisionAuthoring} from "../goals/vision_checkpoint.ts";
 
 import {
   interpretQuotaShouldRunPacket,
@@ -251,14 +253,18 @@ function replanReadPrecision(source: JsonObject, supplied: unknown): ReplanReadP
     equalProjection: (left, right) => projectedIdentity(left) === projectedIdentity(right)};
 }
 
+function replanAuthoringStepIndex(reference: unknown): number | null {
+  const match = typeof reference === "string"
+    ? /^\$\.interaction_contract\.cli_channel\.settlement_plan\.ordered_steps\[(0|[1-9]\d*)\]\.vision_authoring$/.exec(reference) : null;
+  return match ? Number(match[1]) : null;
+}
+
 function replanAuthoringContract(payload: JsonObject, precision?: ReplanReadPrecision): JsonObject {
   const contract = jsonObject(jsonObject(payload.replan_action_packet)?.writeback_contract) ?? {};
   if (!Object.hasOwn(contract, "vision_authoring_ref")) return contract;
-  const reference = contract.vision_authoring_ref;
-  const match = typeof reference === "string"
-    ? /^\$\.interaction_contract\.cli_channel\.settlement_plan\.ordered_steps\[(0|[1-9]\d*)\]\.vision_authoring$/.exec(reference) : null;
+  const index = replanAuthoringStepIndex(contract.vision_authoring_ref);
   const steps = object(object(object(payload.interaction_contract).cli_channel).settlement_plan).ordered_steps;
-  const step = object(match && Array.isArray(steps) ? steps[Number(match[1])] : null);
+  const step = object(index !== null && Array.isArray(steps) ? steps[index] : null);
   if (Object.hasOwn(contract, "vision_authoring") || step.kind !== "durable_writeback" ||
       Object.hasOwn(step, "vision_authoring_ref") || !Object.keys(object(step.vision_authoring)).length) {
     throw new EffectRuntimeRequestError("Replan authoring reference must resolve to one complete inline durable-writeback owner");
@@ -266,6 +272,33 @@ function replanAuthoringContract(payload: JsonObject, precision?: ReplanReadPrec
   const {vision_authoring_ref: _reference, ...fields} = contract;
   const resolved = {...fields, vision_authoring: step.vision_authoring};
   return precision?.retain(resolved, contract) ?? resolved;
+}
+
+/** The staged view points to the same validated step as the complete capture. */
+function shareStagedStrideAuthoring(payload: JsonObject, stride: JsonObject, plan: JsonObject,
+    precision?: ReplanReadPrecision): {plan: JsonObject; reference: string} | undefined {
+  if (payload.schema_version !== COMPLETE_TURN_DECISION_VERSION ||
+      stride.required_on_periodic_review !== true || !Array.isArray(plan.ordered_steps)) return undefined;
+  const packet = object(payload.replan_action_packet);
+  const review = object(object(payload.autonomous_replan_obligation).replan_context);
+  const example = jsonObject(stride.minimal_example);
+  const index = replanAuthoringStepIndex(object(packet.writeback_contract).vision_authoring_ref);
+  if (index === null || !example || example.reference_context_id !== review.context_id ||
+      example.reference_obligation_id !== packet.obligation_id) return undefined;
+  const step = jsonObject(plan.ordered_steps[index]);
+  const authoring = jsonObject(step?.vision_authoring);
+  if (step?.kind !== "durable_writeback" || !authoring) return undefined;
+  const combined = stagedStrideVisionAuthoring(authoring, example, payload.goal_id,
+    payload.agent_id ?? object(payload.agent_identity).agent_id);
+  if (!combined) return undefined;
+  const retain = precision?.retain ?? ((view: JsonObject) => view);
+  const updated = retain({...step, vision_authoring: combined}, step,
+    Object.keys(step).filter(key => key !== "vision_authoring"));
+  return {
+    plan: retain({...plan, ordered_steps: plan.ordered_steps.map((item, i) => i === index ? updated : item)},
+      plan, Object.keys(plan).filter(key => key !== "ordered_steps")),
+    reference: `$.writeback.settlement_plan.ordered_steps[${index}].vision_authoring`,
+  };
 }
 
 
@@ -678,7 +711,7 @@ function selectedTodo(payload: JsonObject, recommendedAction: string | null): Js
 
 /** These reads stay on one captured observation; they never re-enter the guard. */
 function replanReadCommands(payload: JsonObject, path = payload.replan_read_path,
-  argv = payload.replan_read_argv ?? ["loopx"], verifiedSourceHash?: string): JsonObject | null {
+  argv = payload.replan_read_argv ?? ["loopx"], verifiedSourceHash?: string, progressive = false): JsonObject | null {
   const packet = object(payload.replan_action_packet);
   if (typeof path !== "string" || !path.trim() || path.includes("\0") || payload.ok !== true ||
       payload.effective_action === EffectiveAction.GOVERNED_CAPABILITY_INTENT ||
@@ -689,8 +722,10 @@ function replanReadCommands(payload: JsonObject, path = payload.replan_read_path
   if (!Array.isArray(argv) || !argv.length || argv.some(arg => typeof arg !== "string" || !arg || /[\x00-\x1f]/.test(arg))) {
     throw new EffectRuntimeRequestError("captured replan CLI route is malformed");
   }
+  const mode = progressive && payload.schema_version === COMPLETE_TURN_DECISION_VERSION &&
+    object(packet.stride_control).required_on_periodic_review === true ? " --context-delivery on" : "";
   const command = `${argv.map(arg => shellQuote(arg as string)).join(" ")} --format json quota replan-view --decision-file ${shellQuote(path)}` +
-    ` --source-hash ${verifiedSourceHash ?? decisionSourceHash(payload)}`;
+    ` --source-hash ${verifiedSourceHash ?? decisionSourceHash(payload)}${mode}`;
   return {review: `${command} --replan-stage review`, writeback: `${command} --replan-stage writeback`,
     acceptance: `${command} --replan-stage acceptance`, explore: `${command} --replan-stage explore`};
 }
@@ -892,7 +927,9 @@ function projectReplanView(request: JsonObject, payload: JsonObject, sourceHash:
   // A native journal binds its path after planning. The CLI supplies that same
   // physical source route without modifying the captured observation or hash.
   const path = request.captured_decision_path ?? payload.replan_read_path;
-  const reads = replanReadCommands(payload, path, payload.replan_read_argv ?? request.reader_argv ?? ["loopx"], sourceHash);
+  const progressive = request.progressive === true;
+  const reads = replanReadCommands(payload, path, payload.replan_read_argv ?? request.reader_argv ?? ["loopx"],
+    sourceHash, progressive);
   const sourceRead = reads ? {source_read: `cat -- ${shellQuote(path as string)}`} : {};
   if (request.stage === "acceptance") {
     const {outcomes, ambiguous} = replanGoalContext(payload, reads, undefined, precision);
@@ -914,14 +951,20 @@ function projectReplanView(request: JsonObject, payload: JsonObject, sourceHash:
     // decision evidence. Top-level required_fields cannot describe that shape.
     for (const key of ["decision_followthrough", "explore_basis", "decision_value_review"]) delete stride[key];
     const contract = {...originalContract};
-    if (contract.vision_authoring) {
+    const writeback = object(actionProjection(payload, false, precision, sourceHash).writeback);
+    const plan = object(writeback.settlement_plan);
+    const shared = progressive ? shareStagedStrideAuthoring(payload, stride, plan, precision) : undefined;
+    if (shared) {
+      writeback.settlement_plan = shared.plan;
+      contract.vision_authoring_ref = shared.reference;
+      delete contract.vision_authoring;
+      delete stride.minimal_example;
+    } else if (contract.vision_authoring) {
       const originalAuthoring = jsonObject(contract.vision_authoring) ?? {};
       const authoring = retain({...originalAuthoring}, originalAuthoring);
       delete authoring.minimal_example;
       contract.vision_authoring = authoring;
     }
-    const writeback = object(actionProjection(payload, false, precision, sourceHash).writeback);
-    const plan = object(writeback.settlement_plan);
     const boundContract = payload.schema_version === COMPLETE_TURN_DECISION_VERSION
       ? contract : bindReplanSuccessorContract(contract, plan);
     if (typeof boundContract.successor_command === "string" && typeof object(plan.identity).turn_instance_id === "string") {
@@ -959,6 +1002,8 @@ function projectReplanView(request: JsonObject, payload: JsonObject, sourceHash:
     retain(follow, originalFollow, [["recorded_progress_count", "observation_count"]]);
   } else retain(follow, originalFollow, followFields);
   const explore = jsonObject(context.explore_basis) ?? {};
+  const yardstickCount = Array.isArray(explore.work_yardsticks) ? explore.work_yardsticks.length : 0;
+  const reversal = reads ? scopedReplanYardstickReversal(payload) : undefined;
   const decisionValueReview = jsonObject(jsonObject(packet.stride_control)?.decision_value_review);
   const review = retain({...common,
     core_goal: core,
@@ -975,8 +1020,8 @@ function projectReplanView(request: JsonObject, payload: JsonObject, sourceHash:
       availability: explore.availability, revision: explore.revision,
       ...(Array.isArray(explore.measurement_feedback) && explore.measurement_feedback.length
         ? {measurement_count: explore.measurement_feedback.length} : {}),
-      ...(Array.isArray(explore.work_yardsticks) && explore.work_yardsticks.length
-        ? {yardstick_count: explore.work_yardsticks.length} : {}),
+      ...(yardstickCount ? {yardstick_count: yardstickCount} : {}),
+      ...(reversal ? {work_yardstick_reversal: retain(compactFields(reversal.cue, reversal.fields), reversal.cue)} : {}),
       read_action: reads?.explore ?? null,
     }, explore, ["availability", "revision"])}} : {}),
     evidence: (Array.isArray(context.evidence) ? context.evidence : []).map(value => {
@@ -1570,9 +1615,10 @@ function signatureCoverage(envelope: JsonObject, responsePlanValue: unknown): st
  * with its existing owner. Explicit unknown/null declarations are never v0.
  * This does not make the bounded envelope a complete future work contract.
  */
-export function assertTurnEnvelopeConsumerVersion(envelope: JsonObject): void {
+export function assertTurnEnvelopeConsumerVersion(envelope: JsonObject, allowUnversionedHistory = false): void {
   assertSupportedQuotaPacket(envelope);
-  if (envelope.schema_version !== TURN_ENVELOPE_SCHEMA_VERSION) {
+  if (envelope.schema_version !== TURN_ENVELOPE_SCHEMA_VERSION &&
+      !(allowUnversionedHistory && !Object.hasOwn(envelope, "schema_version"))) {
     throw new EffectRuntimeRequestError("unsupported TurnEnvelope schema_version; use a compatible consumer");
   }
   const signature = object(envelope.action_signature);
@@ -1796,8 +1842,8 @@ export function completeHostSource(request: JsonObject): {decision: JsonObject; 
 
 /** A current private plan stores its one admitted source and transport header.
  * The old plan codec is read only for recorded journals or explicit old input. */
-export function turnPlanWorkSource(plan: JsonObject, numberTokens?: unknown): {
-  work: JsonObject; decision: JsonObject | null; scopedIdentity: JsonObject | null | undefined;
+function checkedTurnPlanSource(plan: JsonObject, numberTokens?: unknown): {
+  work: JsonObject; decision: JsonObject | null;
 } {
   if (plan.schema_version === "loopx_turn_plan_v1") {
     if (!Object.hasOwn(plan, "work_contract") || Object.hasOwn(plan, "turn_envelope")
@@ -1809,8 +1855,7 @@ export function turnPlanWorkSource(plan: JsonObject, numberTokens?: unknown): {
         turn_key: object(plan.transaction).turn_key, source_decision_hash: plan.source_decision_hash,
         ...(Object.hasOwn(plan, "detail_ref") ? {detail_ref: plan.detail_ref} : {})}});
     const work = {goal_id: checked.decision.goal_id ?? null, ...checked.projection};
-    return {work, decision: checked.decision, scopedIdentity: scopedTurnSettlementIdentity(work,
-      object(plan.transaction).turn_instance_id)};
+    return {work, decision: checked.decision};
   }
   if (Object.hasOwn(plan, "schema_version") && plan.schema_version !== "loopx_turn_plan_v0") {
     throw new EffectRuntimeRequestError("unsupported Turn plan version");
@@ -1819,9 +1864,22 @@ export function turnPlanWorkSource(plan: JsonObject, numberTokens?: unknown): {
   if (Object.hasOwn(plan, "work_contract")) {
     const checked = completeHostSource({payload: plan.work_contract, envelope,
       source_number_tokens: numberTokens});
-    return {work: {...envelope, ...checked.projection}, decision: checked.decision, scopedIdentity: undefined};
+    return {work: {...envelope, ...checked.projection}, decision: checked.decision};
   }
-  return {work: envelope, decision: null, scopedIdentity: undefined};
+  // Older journals can omit the envelope header. A declared version or
+  // signature format must pass the same compatibility check as Host input.
+  assertTurnEnvelopeConsumerVersion(envelope, true);
+  return {work: envelope, decision: null};
+}
+
+export function turnPlanWorkSource(plan: JsonObject, numberTokens?: unknown): {
+  work: JsonObject; decision: JsonObject | null; scopedIdentity: JsonObject | null | undefined;
+} {
+  const source = checkedTurnPlanSource(plan, numberTokens);
+  const scopedIdentity = plan.schema_version === "loopx_turn_plan_v1"
+    ? scopedTurnSettlementIdentity(source.work, object(plan.transaction).turn_instance_id)
+    : undefined;
+  return {...source, scopedIdentity};
 }
 
 function admittedDriverLineage(work: JsonObject, decision: JsonObject | null,
@@ -1833,9 +1891,7 @@ function admittedDriverLineage(work: JsonObject, decision: JsonObject | null,
   const signature = turnEnvelopeActionSignatureDocument(work);
   signature.action = {...object(signature.action), selected_todo: selected};
   return {
-    ...(decision ? {goal_id: decision.goal_id ?? null,
-      agent_id: object(decision.agent_identity).agent_id ?? null,
-      todo_id: selectedWorkTodoId(decision) ?? ""} : {}),
+    ...(decision ? completeWorkIdentity(decision) : {}),
     route: complete ? admittedTurnRoute(work, () => scopedTurnSettlementIdentity(work))
       : turnEnvelopeRoute(work, historical),
     action_signature: signature,
@@ -1870,24 +1926,28 @@ function completeHostDecision(request: JsonObject): JsonObject {
   return completeHostSource(request).decision;
 }
 
-/** Reuse the existing presentation plan only after its complete source passes
- * the versioned decision owner. The unsigned root is used for path selection;
- * edits and recovery still address the unchanged, signed original capture. */
-function checkedContextPresentationPlan(request: JsonObject): JsonObject {
+function checkedContextPresentationSource(request: JsonObject): JsonObject {
   const context = requireJsonObject(request.context, "current projection");
   if (request.surface === "complete_turn") {
     const numbers = sourceNumberTokens(request, request.source_number_tokens)
       .filter(({path}) => path[0] === "context").map(({path, token}) => [path.slice(1), token]);
     requireCompleteTurnDecision(context, numbers);
   }
+  return context;
+}
+
+/** The unsigned root is used for path selection; edits and recovery still
+ * address the unchanged, signed original capture. */
+function checkedContextPresentationPlan(request: JsonObject): JsonObject {
+  const context = checkedContextPresentationSource(request);
   const staged = nativeReplanPresentation(request);
   if (staged) return staged;
   if (request.surface !== "complete_turn")
-    return progressiveContextPlan({payload: context, surface: request.surface}, progressivePreparationScope(context));
+    return progressiveContextPlan({payload: context, surface: request.surface}, progressivePreparationScopes(context));
   const source = {...context};
   delete source.schema_version;
   delete source.contract_binding;
-  return progressiveContextPlan({payload: source, surface: "quota_packet"}, progressivePreparationScope(source));
+  return progressiveContextPlan({payload: source, surface: "quota_packet"}, progressivePreparationScopes(source));
 }
 
 function completeWorkIdentity(decision: JsonObject): JsonObject {
@@ -1920,7 +1980,10 @@ export function composeCompleteTurnDecision(value: unknown): JsonObject {
   if (typeof request.scheduler_execution_args !== "string") {
     throw new EffectRuntimeRequestError("Turn scheduler execution binding must be a string");
   }
+  const embed = request.embed_in_complete_source !== undefined &&
+    requireBoolean(request.embed_in_complete_source, "embed_in_complete_source");
   if (payload.schema_version === COMPLETE_TURN_DECISION_VERSION) {
+    if (embed) throw new EffectRuntimeRequestError("recorded Turn context cannot be rebound");
     const prior = requireCompleteTurnDecision(payload, request.source_number_tokens);
     if (object(prior.contract_binding).scheduler_execution_args !== request.scheduler_execution_args) {
       throw new EffectRuntimeRequestError("complete Turn decision cannot change its host binding");
@@ -1929,6 +1992,11 @@ export function composeCompleteTurnDecision(value: unknown): JsonObject {
   }
   if (Object.hasOwn(payload, "schema_version") || Object.hasOwn(payload, "contract_binding")) {
     throw new EffectRuntimeRequestError("complete Turn decision source contains reserved version/binding fields");
+  }
+  const contributions = Array.isArray(payload.turn_context_contributions) ? payload.turn_context_contributions : [];
+  const draftCount = contributions.filter(value => jsonObject(value) && !Object.hasOwn(value, "basis_digest")).length;
+  if (embed ? draftCount === 0 || draftCount !== contributions.length : draftCount !== 0) {
+    throw new EffectRuntimeRequestError("unbound capability context requires the original quota composition");
   }
   requireCompleteDecisionSource(payload);
   const sourceIdentity = contextSourceIdentity(payload, request.source_number_tokens ?? []);
@@ -2322,34 +2390,51 @@ function readyWriteScope(context: JsonObject): ReusableExactBody | undefined {
     sourceIdentity: JSON.stringify([route, context.goal_ref ?? null, boundary.handoff_mode ?? null])};
 }
 
-/** Present the long scope list on demand only while an ordinary Turn prepares work. */
-function progressivePreparationScope(payload: JsonObject):
-  {path: string[]; marker_path: string[]; instruction: string} | undefined {
+/** Work preparation retains current controls and keeps long scope lists at their exact source addresses. */
+function progressivePreparationScopes(payload: JsonObject): PreparationScopeDetail[] {
   const interaction = jsonObject(payload.interaction_contract);
   const cli = jsonObject(interaction?.cli_channel);
   const preparation = jsonObject(cli?.execution_preparation);
   if (interaction?.schema_version !== INTERACTION_CONTRACT_SCHEMA_VERSION ||
-      payload.should_run !== true || payload.effective_action !== EffectiveAction.NORMAL_RUN ||
+      payload.should_run !== true ||
       jsonObject(interaction.agent_channel)?.delivery_allowed !== false ||
-      cli?.spend_allowed_now !== false || cli.spend_after_validation !== false) return undefined;
+      cli?.spend_allowed_now !== false || cli.spend_after_validation !== false) return [];
+  const obligation = jsonObject(payload.execution_obligation);
+  const repair = payload.effective_action === EffectiveAction.AGENT_WORKSPACE_REPAIR &&
+    interaction.mode === EffectiveAction.AGENT_WORKSPACE_REPAIR && payload.workspace_repair_allowed === true &&
+    payload.normal_delivery_allowed === false && payload.recovery_delivery_allowed === false &&
+    obligation?.kind === EffectiveAction.AGENT_WORKSPACE_REPAIR && obligation.contract === "agent_workspace_guard" &&
+    obligation.must_attempt_work === true && obligation.delivery_allowed === false;
+  if (!repair && payload.effective_action !== EffectiveAction.NORMAL_RUN) return [];
   const selecting = cli.selection_required === true && !Object.hasOwn(cli, "execution_preparation") &&
     jsonObject(cli.selection_command)?.schema_version === "action_selection_cli_command_v1";
   const claiming = cli.selection_required !== true && payload.normal_delivery_allowed === false &&
     preparation?.schema_version === EXECUTION_PREPARATION_SCHEMA_VERSION && preparation.state === "claim_required" &&
     preparation.delivery_allowed === false && jsonObject(preparation.claim)?.host_execution_allowed === true;
-  if (!selecting && !claiming) return undefined;
+  if (!repair && !selecting && !claiming) return [];
   const boundary = jsonObject(payload.goal_boundary);
-  const scopes = boundary?.write_scope;
   // The recovery pointer and its guidance also cost bytes. Leave short lists inline.
-  if (!boundary || Object.hasOwn(boundary, "write_scope_pointer") ||
-      !Array.isArray(scopes) || scopes.some(scope => typeof scope !== "string") ||
-      Buffer.byteLength(JSON.stringify(scopes)) < 1024) return undefined;
-  return {
+  const longScope = (value: unknown) => Array.isArray(value) && value.every(scope => typeof scope === "string")
+    && Buffer.byteLength(JSON.stringify(value)) >= 1024;
+  const scopes: PreparationScopeDetail[] = [];
+  if (boundary && !Object.hasOwn(boundary, "write_scope_pointer") && longScope(boundary.write_scope)) scopes.push({
     path: ["goal_boundary", "write_scope"],
     marker_path: ["goal_boundary", "write_scope_pointer"],
-    instruction: "If choosing work depends on write scope, select the pointer in goal_boundary.write_scope_pointer from the source below. "
-      + "Use the complete current scope from the ready decision before delivery. ",
-  };
+    instruction: repair
+      ? "If workspace repair needs the Goal's write scopes, select /goal_boundary/write_scope from the source below. "
+      : "If choosing work depends on write scope, select the pointer in goal_boundary.write_scope_pointer from the source below. "
+        + "Use the complete current scope from the ready decision before delivery. ",
+  });
+  const selected = jsonObject(payload.selected_todo);
+  if (repair && selected?.schema_version === "quota_selected_todo_v0" &&
+      typeof selected.todo_id === "string" && longScope(selected.required_write_scopes)) scopes.push({
+    path: ["selected_todo", "required_write_scopes"],
+    instruction: "If workspace repair needs the Todo's requested write scopes, select /selected_todo/required_write_scopes from the source below. ",
+  });
+  const finalScope = scopes.at(-1);
+  if (repair && finalScope) finalScope.instruction +=
+    "After relocating, rerun the guard for this Turn and use its complete current scopes before delivery. ";
+  return scopes;
 }
 
 function nativeReplanPresentation(request: JsonObject): JsonObject | undefined {
@@ -2366,10 +2451,13 @@ function nativeReplanPresentation(request: JsonObject): JsonObject | undefined {
       || typeof packet.obligation_id !== "string"
       || packet.obligation_id !== review.obligation_id || packet.review !== undefined
       || packet.writeback !== undefined) return undefined;
+  // A bound reversal is a first-read fact. Keep its original addresses so the
+  // ordinary opening can deliver the cue before the agent chooses a candidate.
+  if (request.surface === "complete_turn" && scopedReplanYardstickReversal(source)) return undefined;
   const precision = replanReadPrecision(request, request.source_number_tokens);
   const identity = precision?.identity ?? contextSourceIdentity(request);
   const view = replanCliView(source, (value, field) => identity(value, ["context", ...field]),
-    replanReadCommands(source, path), precision);
+    replanReadCommands(source, path, undefined, undefined, true), precision);
   return view === source ? undefined : {staged_context: view, deferred: [], instructions: []};
 }
 
@@ -2401,6 +2489,12 @@ export function evaluateTurnEnvelope(value: unknown): JsonObject {
   const request = requireJsonObject(value, "turn envelope request");
   const operation = request.operation;
   if (operation === "planning_facts") return completePlanningFacts(request);
+  if (operation === "recorded_plan_lineage") {
+    const {work, decision} = checkedTurnPlanSource(
+      requireJsonObject(request.plan, "recorded Turn plan"), request.source_number_tokens);
+    const identity = decision === null ? work : completeSessionLineage(decision);
+    return {goal_id: identity.goal_id ?? null, agent_id: identity.agent_id ?? null};
+  }
   if (operation === "plan_work") {
     const {decision, projection} = completeHostSource(request);
     return {goal_id: decision.goal_id ?? null, ...projection};
@@ -2517,17 +2611,23 @@ export function evaluateTurnEnvelope(value: unknown): JsonObject {
   if (operation === "driver_lineage") {
     const completeWire = Object.hasOwn(request, "complete_host_request");
     const checked = Object.hasOwn(request, "payload") || completeWire ? completeHostSource(request) : null;
+    if (completeWire && checked) {
+      // The journal already owns the Turn key. A checked retry needs only
+      // Session binding facts, not a new route or the action hash preimage.
+      const work: JsonObject = {goal_id: checked.decision.goal_id ?? null, ...checked.projection};
+      const scopedIdentity = scopedTurnSettlementIdentity(work);
+      const hasSelectedTodo = scopedIdentity !== null && Object.keys(selectedWorkTodo({
+        selected_todo: object(object(work.action).selected_todo),
+        task_orchestration_contract: work.task_orchestration_contract,
+      })).length > 0;
+      return {...completeWorkIdentity(checked.decision), scoped_settlement_identity: hasSelectedTodo ? null : scopedIdentity};
+    }
     const decision = checked?.decision ?? null;
-    // Recovery consumes the already checked action facts. It does not rebuild
-    // a v0 adapter, cold reader commands or size diagnostics from that source.
-    // Historical carriers keep their signed envelope and version-pinned proof.
-    const work = completeWire && checked ? {goal_id: checked.decision.goal_id ?? null, ...checked.projection}
-      : requireJsonObject(request.envelope, "Turn driver envelope");
+    const work = requireJsonObject(request.envelope, "Turn driver envelope");
     const historical = !decision && request.historical_route_text !== undefined
       ? requireJsonObject(request.historical_route_text, "historical route text") : undefined;
-    // Both planning and recovery use these action/selection/hash facts. Python
-    // retains only its persisted number codec; historical readers keep proof.
-    return admittedDriverLineage(work, decision, completeWire, historical);
+    // Historical carriers retain their signed envelope and version-pinned proof.
+    return admittedDriverLineage(work, decision, false, historical);
   }
   if (operation === "execution_context") {
     // The CLI consumes one checked source for execution, not the historical
@@ -2540,6 +2640,7 @@ export function evaluateTurnEnvelope(value: unknown): JsonObject {
       sha256: completeTaskTextSha256(decision, selectedWorkTodoId(work) ?? ""),
       effective_action: decision.effective_action ?? null,
       writeback: object(projection.writeback),
+      task_lease_proof: object(object(decision.execution_preparation).lease_proof),
       replan_guard_scoped: Object.hasOwn(projection, "replan_action_packet"),
       replan_action_packet: projection.replan_action_packet ?? null};
   }
@@ -2591,10 +2692,14 @@ export function evaluateTurnEnvelope(value: unknown): JsonObject {
   }
   if (operation === "progressive_context_delivery")
     return prepareProgressiveContext(request, checkedContextPresentationPlan(request));
-  if (operation === "context_delivery") return request.native_projection === undefined
-    ? prepareContextDelivery(request, LEGACY_QUOTA_CONTEXT_FIELDS)
-    : prepareProgressiveContextDelivery(request, LEGACY_QUOTA_CONTEXT_FIELDS, INITIAL_CONTEXT_DECISION_FIELDS,
+  if (operation === "context_delivery") {
+    if (request.native_projection === undefined) {
+      if (request.surface === "complete_turn") checkedContextPresentationSource(request);
+      return prepareContextDelivery(request, LEGACY_QUOTA_CONTEXT_FIELDS);
+    }
+    return prepareProgressiveContextDelivery(request, LEGACY_QUOTA_CONTEXT_FIELDS, INITIAL_CONTEXT_DECISION_FIELDS,
       checkedContextPresentationPlan(request), readyWriteScope(requireJsonObject(request.context, "current projection")));
+  }
   if (operation === "native_context_lifecycle") return updateNativeContextLifecycle(request);
   if (operation === "context_recovery") return restoreContextDelivery(request, LEGACY_QUOTA_CONTEXT_FIELDS);
   if (operation === "bind_capture") return bindTurnDecisionCapture(request);

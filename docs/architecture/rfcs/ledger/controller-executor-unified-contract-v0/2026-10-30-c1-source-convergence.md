@@ -2904,3 +2904,42 @@ frozen tested bytes; five observed Python processes, 1,179 Core modules and six
 observed subprocess paths show no checkout Core imports. The same audit-coverage
 limits, synthetic providers, unqualified live-model adoption and complete-cost
 claims apply. Independent review and whole-C1 acceptance remain open.
+
+### Visible host scheduler observations
+
+Pi, OpenCode and OpenCode 2 now read the existing scheduler observation for a
+bound Agent. The same Core decision supplies the runnable state, reset token,
+wait limits and terminal-source proof. This replaces those callers' ordinary
+model-context reads, which could return a progressive navigation reference
+without the fields their scheduler needs. OpenCode and OpenCode 2 read the
+current cold-path cadence and still accept the historical cadence shape. Their
+explicit host poll receipt uses its existing writer once per probe.
+
+The observation has no Turn, capture or settlement effect. Work delivery uses
+its original context policy. Older host bindings without an Agent ID use the
+explicit full observation until they acquire an Agent binding. Keep the host
+adapter and CLI on the same build when upgrading or rolling back. The retained
+original-version Turn readers still cover outstanding work in their supported
+recovery window.
+
+### Recover rejected complete-source composition
+
+Failed composition now records the existing transport-failure contract at the
+capture root, with `ok=false` and `should_run=false`. Every original input fact
+is retained under `source_diagnostic`, beside the exact original receipt and
+the runtime's typed composition diagnostic. Both semantic rejection and runtime
+startup failure follow this path. The regular digest-checked selected reader
+provides diagnostic recovery.
+
+Current-source consumers require a successfully composed decision before
+publishing work or native claim preparation. This closes the path where a
+rejected current input could be mistaken for an unversioned historical capture.
+Genuine historical captures use their explicit recovery readers. A failure in
+delivery after successful composition retains the validated original capture.
+
+Focused synthetic File/SQLite cases cover unknown actions, unknown interaction
+versions and composition unavailability after admission. Their independent
+oracles check full diagnostic readback, rejected execution projection, native
+journal and claim-source effects, one original receipt and zero spend. Existing
+pause, capture, handoff and historical recovery coverage qualifies the adjacent
+boundary. Whole-C1 acceptance and live-model effectiveness remain open.

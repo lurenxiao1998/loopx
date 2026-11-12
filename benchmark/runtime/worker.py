@@ -14,7 +14,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 
-from benchmark.runtime.codex import Execution, prepare_codex_home, process_environment
+from benchmark.runtime.codex import Execution, explicit_turn_display, prepare_codex_home, process_environment
 
 from benchmark.runtime.scheduler import PHASE_WORK_RESERVE_SECONDS as PHASE_WORK_RESERVE_SECONDS
 from benchmark.runtime.scheduler import phase_work_reserve
@@ -95,18 +95,19 @@ def heartbeat_body(env: dict[str, str], turn_id: str, *, native_goal: bool,
     ]
     if not native_goal:
         command += ["--turn-instance-id", turn_id]
-    if env.get("LOOPX_TURN_ENVELOPE", "0") not in {"0", "1"}:
-        raise ValueError("LOOPX_TURN_ENVELOPE must be 0 or 1")
+    display = explicit_turn_display(env)
     context_dir = env.get("LOOPX_CODEX_CONTEXT_DIR") if env.get("LOOPX_CONTEXT_DELIVERY") == "on" else None
-    if env.get("LOOPX_TURN_ENVELOPE") == "1" or decision_handoff_socket is not None or context_dir:
+    if display.complete_turn or display.turn_envelope or decision_handoff_socket is not None or context_dir:
         if native_goal:
             raise ValueError("TurnEnvelope capture requires a host-owned heartbeat Turn")
         # Wake identity comes from this worker, never from model-authored text.
         root = Path(env["LOOPX_WAKE_LOG_DIR"]) / turn_id / "decisions"
         root.mkdir(mode=0o700, exist_ok=False)
         command += ["--decision-output-root", str(root)]
-        if env.get("LOOPX_TURN_ENVELOPE") == "1":
+        if display.turn_envelope:
             command += ["--turn-envelope"]
+        if display.complete_turn:
+            command += ["--complete-turn"]
         if decision_handoff_socket is not None:
             command += ["--decision-handoff-socket", decision_handoff_socket]
         if context_dir:
@@ -149,6 +150,8 @@ def child_process(command: list[str], *, env: dict[str, str], stdout, stderr,
         # launch with the existing Goal lifetime owner, never the whole model run.
         with (goal_admission.launch_lifetime(operation="codex_agent_host_launch")
               if goal_admission is not None else nullcontext()):
+            # The child can write a native event before Popen returns.
+            launch_started_at_unix = time.time()
             process = subprocess.Popen(
                 command,
                 cwd=env["LOOPX_PROJECT"],
@@ -163,7 +166,7 @@ def child_process(command: list[str], *, env: dict[str, str], stdout, stderr,
                 umask=0o077 if os.name == "posix" and env.get("LOOPX_CONTEXT_DELIVERY") == "on" else -1,
             )
         if process_observation is not None:
-            process_observation.started(process)
+            process_observation.started(process, launch_started_at_unix=launch_started_at_unix)
         yield process
     except BaseException as exc:
         scope_error = type(exc).__name__
@@ -213,12 +216,15 @@ def native_child_process(command, *, env, stdout, stderr, session_wake, receipt,
         guard = ProviderRequestAdmission(env, session_wake, receipt, wake,
             timeout=timeout, original_quota=original_quota)
         scope = guard.serve(command)
-    observation = guard
+    native_observation = None
     if env.get("LOOPX_HOST_ATTEMPT_ID") and session_wake is not None:
         from loopx.capabilities.benchmark_toolkit.native_codex_process import NativeCodexProcessObservation
-        from .interruption_recovery import ProcessObservers
 
         native_observation = NativeCodexProcessObservation(lambda value: receipt.update(native_process=value))
+    observation = None
+    if native_observation is not None or guard is not None:
+        from .interruption_recovery import ProcessObservers
+
         observation = ProcessObservers(native_observation, guard)
     with scope as routed:
         with child_process(routed, env=env, stdout=stdout, stderr=stderr,
@@ -519,8 +525,7 @@ def _phase_timeout(timeout: float | None, deadline: float | None) -> tuple[float
 def run_once(env: dict[str, str]) -> dict:
     if env.get("LOOPX_CONTEXT_DELIVERY", "off") not in {"off", "on"}:
         raise ValueError("LOOPX_CONTEXT_DELIVERY supports only off or on")
-    if env.get("LOOPX_TURN_ENVELOPE", "0") not in {"0", "1"}:
-        raise ValueError("LOOPX_TURN_ENVELOPE must be 0 or 1")
+    display = explicit_turn_display(env)
     topology = env.get("LOOPX_TURN_TOPOLOGY", "single-worker")
     if topology not in {"single-worker", "controller-worker"}:
         raise ValueError("unknown governed Turn topology")
@@ -533,10 +538,11 @@ def run_once(env: dict[str, str]) -> dict:
                          if env.get("LOOPX_CODEX_TURN_TIMEOUT_SEC") else None),
         validation_command=json.loads(env.get("LOOPX_VALIDATION_COMMAND_JSON", "[]")),
         task_entry=env.get("LOOPX_TASK_ENTRY"),
-        turn_envelope=env.get("LOOPX_TURN_ENVELOPE", "0") == "1",
+        turn_envelope=display.turn_envelope,
         context_delivery=env.get("LOOPX_CONTEXT_DELIVERY"),
         native_child_limit=(int(env["LOOPX_NATIVE_CHILD_LIMIT"])
                             if env.get("LOOPX_NATIVE_CHILD_LIMIT") else None),
+        complete_turn=display.complete_turn,
     )
     request_admission = False
     if env.get("LOOPX_PROVIDER_REQUEST_ADMISSION", "off") != "off":
@@ -584,6 +590,8 @@ def run_once(env: dict[str, str]) -> dict:
            if observation_producer is not None else {}),
         **({"turn_envelope": True, "turn_envelope_source": "explicit"}
            if execution.turn_envelope else {}),
+        **({"complete_turn": True, "complete_turn_source": "explicit"}
+           if execution.complete_turn else {}),
         **({"context_delivery": "on"} if execution.context_delivery != "off" else {}),
         **({"native_child_limit": execution.native_child_limit}
            if execution.native_child_limit is not None else {}),

@@ -11,19 +11,36 @@ behavior do not supersede the latest audit in the main document.
 The complete single-worker EdgeBench entry and original-wake recovery from
 [#8480](https://github.com/loopx-project/loopx/pull/8480) now have an independent
 main proposal, [#8499](https://github.com/loopx-project/loopx/pull/8499): 23 files,
-+493/−119, with 18 whole files byte-identical to the C1 candidate. After an
++493/−119, with 18 whole files byte-identical at C1 `33a0152376a0`. After an
 accepted main merge, C1 can remove those duplicate diffs by integration. Until
 then retain the working caller and [#8484](https://github.com/loopx-project/loopx/pull/8484)'s
 existing dependency; historical experiment records stay together. This split
 does not qualify the original-quota outcome or complete-cost comparison.
 
 Ordinary guided-start and visible-Goal calls retain their source's agent-owned
-manual settlement. Only the existing qualified native publisher may expose a
-runtime-owned composed recipe. A complete carrier or progressive view cannot
+manual settlement. Qualified native publishers and the explicit complete-Host
+profile may expose a runtime-owned composed recipe. A complete carrier or progressive view cannot
 choose that owner. Five C1 CLI expectations incorrectly demanded composition
 for ordinary calls; current main readback confirms manual ownership. The
 corrected tests preserve the original identity, spend source and command, and
 validate the complete source rather than changing production semantics.
+
+The candidate integrates main `d78064e0c848` and reconciles the proposed
+[#8489](https://github.com/loopx-project/loopx/pull/8489) and
+[#8494](https://github.com/loopx-project/loopx/pull/8494) slices. The explicit Host
+profile uses the existing typed native CLI settlement projection before capture;
+its adapter sends only six eligibility facts alongside the existing plan and
+receipt. This explicit profile adds one bounded projection request before the
+existing source composition; it establishes no net RPC or model-cost saving.
+Ordinary and checkpoint-preloaded workers share the `Execution` decoder.
+There is one complete-source composer, still rejecting transport flags that
+rewrite settlement ownership. After verified writeback, typed readback also
+projects the original pending-spend closeout for Todo-less replans, preserving historical ACK handling and
+once-only settlement. The existing C1 rule keeps an observed review from binding
+an otherwise unbound selection; integrating the main-specific fallback unchanged
+regressed those cases and was rejected. Explicit raw-off retains its v0 view;
+progressive delivery validates the complete v1 source. Installed/in-flight
+adoption, independent review and original-quota outcomes/full costs remain open.
 
 The current complete-source validator also delegates executable required-read
 checks to the existing interaction owner. Explicit command/order coordinates
@@ -608,16 +625,22 @@ evidence justify revised presentation allowances, preserving the original
 failures and all line/growth/authority limits. This accepts additional inline
 cost, not an efficiency win, installed adoption or C1 closure.
 
-Reward Memory participation now reads the typed capability facts once when it
-registers recall and reflection on the native quota and complete Host routes. It
-no longer requests an action signature to decide participation. The verified
-Goal/Agent binding, provider policy and original Host source still gate delivery.
-`capability_context.ts::contextSource` still signs native quota contributions
-against the current work and settlement; retirement of that live branch must
-preserve registration, readback and original-version recovery together. The
-shared capability namespace guard reserves `work_contract` and
-`source_decision_hash` across registration, context and optional result fields;
-rejected contributions leave the original Host source usable.
+Reward Memory uses the typed participation facts for recall and reflection.
+The verified Goal/Agent binding and provider policy still govern participation.
+For native quota, registration validates the optional advice and readback slots
+before the complete Turn is composed. The validated advice remains local to that
+composition until the original source seals it. Reading the advice validates the
+complete source and resolves both the contribution and its readback there.
+This retires the live native quota action-signature calculation for optional
+advice. An unsealed draft cannot be projected or recomposed as recorded advice.
+
+The complete Host still binds contributions that live outside its work contract
+to the verified Turn and source digest. Recorded quota contributions carrying
+`basis_digest` keep their original reader and must match its binding. Retire that
+reader only after reconciling the last supported recorded captures and recovery
+window. Registration, size limits and the shared namespace guard apply to both
+forms, including the reserved `contract_binding` and `turn_context_contributions`
+fields. Optional rejection leaves the governing work source available.
 
 The optional Host projection now uses that existing TypeScript owner for ordered
 merge, collision rejection and per-contribution isolation.
@@ -628,9 +651,8 @@ File/SQLite empty, one/two-provider, current/historical and near-limit cases wit
 unchanged projected advice. Two-provider complete-source RPC falls from four to
 two in that bounded stage. Large batches reuse the existing private snapshot
 transport, adding temporary IO and a measured near-limit latency penalty;
-transport acceptance is extended without raising provider budgets. This is no
-model-token, whole-task cost or accepted-outcome claim. Native quota signature
-retirement, installed adoption and original-quota qualification remain open.
+transport acceptance is extended without raising provider budgets. The comparison covers that projection stage. Installed adoption and the
+original-quota outcome and full-cost comparison remain open.
 
 The [optional-context source follow-up](https://github.com/loopx-project/loopx/pull/8455)
 keeps source-free status readback independent of executable-source extraction,
@@ -642,8 +664,7 @@ must not rewrite that source merely to attach provider readback. Registration,
 namespace, slot and budget checks remain. Valid guidance and recorded wrapped Host
 readers keep their binding and canonical settlement; invalid sources retain status
 observations but cannot deliver advice. This adds native complete-source validation.
-The earlier status-only RPC reduction does not qualify model-window or whole-task
-benefit, and native signature retirement remains open.
+That earlier result covers the status-only path.
 
 Integration with main `5988be01` retains the shared quiet-completion rule and
 keeps the retired alternate heartbeat body deleted. At that checkpoint,
@@ -848,6 +869,20 @@ can still read its original
 bounded result schema under the historical binding. A new Host invocation
 requires the complete binding to deliver that advice. Ordinary quota and
 historical v0 retain their existing decoders.
+
+Failed Turn recovery for the complete Host request now reads only the checked
+Goal, Agent and Todo or scoped settlement binding. It reuses the journaled
+Turn key and no longer returns or hashes the full action to match a Session.
+New planning still uses the persisted number codec and normalizes the adaptive
+primary before deriving a key. Keep the raw and mixed historical readers
+until outstanding work and the supported recovery window are reconciled.
+The upgrade check resumed two original writer formats on File and SQLite.
+Wrong Agent, missing Session and altered capture stopped before the Host or
+spend. A valid retry resumed the original Session, settled once and replayed
+without effects. On the two complete fixtures the Session lookup response
+fell from 10,692 and 10,738 bytes to 130 bytes. These are serialized response
+bytes at this internal boundary; RPC count, model tokens and matched outcome
+costs were not measured by this check.
 
 Modern Codex and structured Host instructions share the existing audit read
 rule: read a declared audit before judging Goal acceptance or proposing

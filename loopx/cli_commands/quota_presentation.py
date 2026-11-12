@@ -33,7 +33,7 @@ def project_scheduler_observation(payload: Mapping[str, object]) -> dict[str, ob
 
     view = select(
         payload, "ok", "goal_id", "goal_ref", "runtime_root", "state",
-        "error", "error_code", "reason", "status", "recommended_action", "effective_action",
+        "error", "error_code", "reason", "status", "recommended_action", "effective_action", "should_run",
     )
     if payload.get("ok") is not True:
         return view
@@ -41,19 +41,29 @@ def project_scheduler_observation(payload: Mapping[str, object]) -> dict[str, ob
     view["interaction_contract"] = {"agent_channel": select(contract.get("agent_channel"), "must_attempt")}
     hint = select(payload.get("scheduler_hint"), "action", "cadence_class", "reason")
     if isinstance(source := payload.get("scheduler_hint"), Mapping):
-        for key, field in (
-            ("unchanged_poll", "local_scheduler"),
-            ("reset_policy", "reset_token"),
-            ("cold_path_detail", "local_scheduler"),
-        ):
+        for key, field in (("reset_policy", "reset_token"), ("cold_path_detail", "local_scheduler")):
             if key in source:
                 hint[key] = select(source[key], field)
+        if isinstance(unchanged := source.get("unchanged_poll"), Mapping):
+            hint["unchanged_poll"] = {
+                **select(unchanged, "local_scheduler", "final_quota_replan_check_enabled",
+                         "final_quota_replan_check_action"),
+                **{key: select(unchanged[key], "local_scheduler")
+                   for key in ("limits", "after_limits") if key in unchanged},
+            }
     view["scheduler_hint"] = hint
+    if isinstance(frontier := payload.get("goal_frontier_projection"), Mapping):
+        view["goal_frontier_projection"] = {
+            "terminal_state": select(frontier.get("terminal_state"), "schema_version", "kind", "derived", "source"),
+            "source_completeness": select(frontier.get("source_completeness"),
+                "schema_version", "user_todos", "agent_todos"),
+        }
     for key, fields in (
         ("selected_todo", ("todo_id",)),
         ("agent_identity", ("agent_id",)),
         ("autonomous_replan_obligation", ("required", "obligation_id", "agent_id", "resolution_mode")),
         ("heartbeat_receipt", ("settlement_identity",)),
+        ("host_poll_receipt", ("recorded", "poll_count", "last_poll_at", "expected_continuation", "error")),
     ):
         if key in payload:
             view[key] = select(payload[key], *fields)
@@ -95,17 +105,21 @@ def native_quota_result(payload, args, *, capture_directory: Path,
     except NativeContextSessionUnavailable:
         # An uninitialized host receives full context without a baseline claim.
         directory = None
+    decision_path = capture_directory / "decision.json"
     prepared = prepare_codex_context(payload, directory=directory,
         capture_directory=capture_directory, goal_id=decision_identity[0], agent_id=decision_identity[1],
         surface=quota_context_surface(captured_payload, args),
         capture_id=capture_id, continuity_generation=getattr(args, "_context_delivery_generation", None),
+        captured_decision_path=str(decision_path) if progressive_enabled else None,
         progressive_enabled=progressive_enabled, captured_recovery={
-            "path": str(capture_directory / "decision.json"), "sha256": capture_id,
-            "command": context_capture_read_command(capture_directory / "decision.json", capture_id),
-        } if directory is not None else None)
+            "path": str(decision_path), "sha256": capture_id,
+            "command": context_capture_read_command(decision_path, capture_id),
+        })
     payload = prepared.delivery
     recovery = payload.get("recovery")
-    payload = native_context_capture_view(payload, capture_directory, context_directory=directory,
+    payload = native_context_capture_view(payload, capture_directory,
+        context_directory=directory if prepared.stateless_recovery is None else None,
+        captured_recovery=prepared.stateless_recovery,
         progressive_enabled=progressive_enabled,
         metadata={"capture_sha256": capture_id, **({"recovery": recovery} if recovery is not None else {})},
         max_page_output_bytes=getattr(args, "max_page_output_bytes", None), reader_argv=reader_argv,
@@ -118,6 +132,7 @@ def compose_quota_cli_source(
     scheduler_context: Mapping[str, object] | SchedulerExecutionContextResolution | None,
     capture_directory: Path | None,
     compose: Callable[..., dict[str, object]],
+    capability_context: list[dict[str, object]],
 ) -> tuple[dict[str, object], bool, dict[str, object] | None]:
     """Prepare one decided source and an optional bounded compatibility display."""
     # Current JSON and Markdown readers consume the same complete source.
@@ -130,12 +145,13 @@ def compose_quota_cli_source(
     if not isinstance(payload.get("interaction_contract"), Mapping):
         return payload, raw_envelope, None
     if not raw_envelope:
-        return compose(payload, scheduler_execution_context=scheduler_context), False, None
+        return compose(payload, scheduler_execution_context=scheduler_context,
+            **({"capability_context": capability_context} if capability_context else {})), False, None
 
     from ..control_plane.quota.turn_envelope import compose_turn_decision_with_raw_envelope
 
     source, view = compose_turn_decision_with_raw_envelope(payload,
-        scheduler_execution_context=scheduler_context,
+        scheduler_execution_context=scheduler_context, capability_context=capability_context,
         captured_decision_path=str(capture_directory / "decision.json") if capture_directory else None)
     return source, True, view
 
@@ -158,7 +174,7 @@ def raw_quota_turn_view(
     return view
 
 
-def _project_native_cli_settlement(payload: dict[str, object]) -> dict[str, object]:
+def _project_native_cli_settlement(payload: dict[str, object], *, explicit_complete: bool = False) -> dict[str, object]:
     """Publish one projected plan before capability binding and capture."""
     from ..control_plane.effect_runtime import EffectRuntimeRemoteError, EffectRuntimeStartupError, effect_runtime_result
     from ..control_plane.quota.turn_envelope import _apply_context_projection_changes
@@ -168,9 +184,22 @@ def _project_native_cli_settlement(payload: dict[str, object]) -> dict[str, obje
     todo = payload.get("selected_todo")
     if not isinstance(cli, Mapping) or not isinstance(todo, Mapping):
         return payload
+    complete_scope = {}
+    if explicit_complete:
+        agent = payload.get("agent_identity")
+        channel = interaction.get("agent_channel") if isinstance(interaction, Mapping) else None
+        # The typed owner needs eligibility, not another copy of Goal/context.
+        complete_scope = {"complete_scope": {
+            **{key: payload.get(key) for key in (
+                "goal_id", "should_run", "effective_action", "normal_delivery_allowed",
+            )},
+            "agent_id": agent.get("agent_id") if isinstance(agent, Mapping) else None,
+            "delivery_allowed": channel.get("delivery_allowed") if isinstance(channel, Mapping) else None,
+        }}
     try:
         projection = effect_runtime_result("settlement.native_cli_projection", {
             "cli": cli, "receipt": payload.get("heartbeat_receipt"), "todo_id": todo.get("todo_id"),
+            **complete_scope,
         })
     except (EffectRuntimeRemoteError, EffectRuntimeStartupError):
         # The already admitted Turn still has its canonical manual plan.

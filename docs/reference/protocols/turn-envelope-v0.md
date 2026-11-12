@@ -9,7 +9,8 @@ This page describes the current versioned representation. The
 [unified-contract RFC](../../architecture/rfcs/controller-executor-unified-contract-v0.md)
 proposes replacing the live quota/envelope format choice with one complete
 contract, including differential delivery. Historical captures retain their
-original schema and signature; the proposal does not introduce a new CLI switch.
+original schema and signature. The explicit complete-v1 Host entry below does
+not switch existing quota or v0 consumers to the proposed unified default.
 The proposed composition point precedes capture and encoding. Today's action
 signature compares its registered projection; equality alone does not establish
 complete source-clause preservation or qualify the unified contract.
@@ -91,7 +92,8 @@ original source, with no extra validation request or model-facing view.
 
 中文：本页记录当前版本。[统一契约提案](../../architecture/rfcs/controller-executor-unified-contract-v0.zh-CN.md)
 的终态是一份包含差分交付能力的完整契约，取消线上 quota/envelope 格式选择；
-历史捕获保留原 schema 与签名。本次文档更新不新增 CLI 开关。
+历史捕获保留原 schema 与签名。显式完整 Host 入口见下节；C1 的完整来源默认与
+关闭渐进后的兼容视图仍分别验收。
 
 在 C1 候选中，`quota should-run --context-delivery off --turn-envelope`
 在 Delta 与托管交接均未启用时仍返回有界 v0。现有组合调用从同一份完整决策返回
@@ -151,6 +153,87 @@ Preview it explicitly:
 ```bash
 loopx --format json quota should-run --goal-id <goal-id> --agent-id <agent-id> --turn-envelope
 ```
+
+### Explicit complete-v1 Host entry / 显式完整 v1 Host 入口
+
+A Host that consumes the existing complete contract can select `--complete-turn`
+on JSON `quota should-run`. It composes `loopx_turn_envelope_v1` before capture;
+the saved source retains original work, acceptance, Stop, required-read and
+permission facts. Ordinary progressive/Delta navigation may be returned instead
+of the full document. Follow its pinned reader without rerunning admission.
+
+```bash
+loopx --format json quota should-run --goal-id <goal-id> --agent-id <agent-id> \
+  --turn-instance-id <turn-id> --complete-turn --decision-output-dir ./complete-001
+```
+
+The flag is mutually exclusive with legacy `--turn-envelope`. In the C1
+candidate, omitting it keeps the existing complete-source default and ordinary
+settlement profile; the explicit raw-off compatibility view remains v0.
+Context delivery is independent: `--context-delivery off` returns the complete v1 document without
+progressive presentation; it does not undo the explicit version choice.
+An older CLI rejects the new flag before guard execution. Omit it to roll back;
+existing complete captures remain readable through their original digest-bound
+`quota context-read`/`context-project` recovery.
+
+`quota context-project` checks a saved complete decision before presenting it
+as current context, including with Delta alone or with context delivery off.
+If the saved source cannot be verified, the returned digest-bound
+`context-read` command selects only its recorded `heartbeat_receipt` for
+diagnosis. Restore the intact, supported source and retry `context-project`
+with the original Goal, Agent, Turn and digest before using it for work.
+Native recovery publishes the current session source after the same typed
+check succeeds. Rejection retires the implicit lookup for the same native
+session, Goal and Agent. The original captures remain available by their
+explicit digest-bound references. For a rejected ready capture, the native
+hook can still read back its recorded claim and lease references. A
+diagnostic read cannot acknowledge delivery of ready work context. Optional
+presentation failures after verification can still refer to the verified capture.
+
+For eligible original Todo plans, the same typed settlement owner projects one
+`refresh-state ... --settle-turn --settlement-receipt` command. It retains the
+original effect identity, validation and terminal conditions. A non-ready
+preparation or mismatched receipt never becomes ready; partial failure returns
+the original `settlement_owed` recovery instead of a second debit. Contract
+composition failure preserves the decided receipt and available original
+capture, reports failure, and grants no work or automatic retry. C1 selects this
+explicit Host settlement profile through the existing native CLI projection
+before sealing the source. The composer still preserves its canonical plan and
+rejects transport flags that try to change settlement ownership. The projection
+sends only eligibility facts alongside the existing plan and receipt, without
+copying the full Goal/context to another request or adding a second composer.
+
+`heartbeat-prompt --thin --complete-turn` preserves the selection on its guard
+and same-Turn selection commands. External benchmark heartbeat adapters may
+explicitly select `--complete-turn` on their runner too; other profiles reject
+it. This developer protocol adds no settings owner, model request, child worker,
+permission or execution allowance. User task time requirements remain task
+context; the caller's private current deadline and runtime guidance are not new
+model context. Actual live adoption and efficiency still require separate proof.
+
+中文：`--complete-turn` 为显式完整 v1 Host 入口，与旧 `--turn-envelope` 互斥。
+C1 候选未选择该选项时仍沿现有完整来源默认和普通结算方式；显式关闭渐进交付并
+选择旧 envelope 时仍保留有界 v0。
+渐进/差分交付独立控制；关闭上下文交付时仍返回已显式选择的完整 v1 文档。
+读取按原摘要绑定的分页，不为补读重新准入。原验收、Stop、权限、必要读取与用户
+任务时间要求保留；不会把调用方私有当前倒计时或常驻 runtime 指导新增到模型输入。
+可执行的原 Todo 结算计划复用同一 typed owner，合并为一条写回并保留原 effect id，
+不把未 ready 的准备或错误回执转成授权。C1 在封存来源前经既有 native CLI 投影
+选择显式 Host 结算方式，composer 仍只保留已决定的原计划，不接受改结算的传输参数。
+请求只补充必要资格事实，不再复制整份 Goal/上下文，也不增加第二个 composer。
+部分失败只沿原 `settlement_owed` 恢复。
+旧 CLI 在 guard 前拒绝新选项，回滚时移除该选项；旧完整 capture 仍用原 reader。
+
+`quota context-project` 先校验已保存的完整决定，再将它呈现为当前上下文。仅开启差分
+或关闭上下文交付时同样校验。来源校验失败或中断时，返回的摘要绑定
+`context-read` 命令只选取原记录的 `heartbeat_receipt` 用于诊断。恢复完整且受支持
+的来源后，以原 Goal、Agent、Turn 和摘要重试 `context-project`，通过后再作为工作
+上下文。原生会话通过同一校验后发布当前来源。拒绝来源时撤下同一会话、Goal 和 Agent
+的隐式读回入口。原捕获仍可通过显式摘要引用读取。准备就绪的捕获被拒绝后，原生
+Hook 仍能读回已记录的领取与租约引用。诊断读取不会确认已交付就绪的工作上下文。
+校验成功后如遇可选呈现失败，仍可读取已验证的捕获。
+这只是 Host 开发协议入口，不新增设置、模型/子 worker、预算或权限，也不证明
+已运行的 Host 采用或效率收益。
 
 For a tool with bounded output, optionally capture the full decided payload before
 its display projection. Choose a **new directory for each invocation**, even when
@@ -295,6 +378,19 @@ legacy prompt only after retaining a valid original capture and executable
 reader; a missing source is never replaced by a fresh guard. The existing generic
 followthrough is now available with stride off; its result-class counts and
 observations remain evidence, not successful-work or goal-gain verdicts.
+
+When the bound Todo's captured Yardstick shows a proxy ordering opposite to the
+authoritative measurement, the first complete Turn read and staged `review`
+show the conflict, the preferred candidate, the proxy's comparison scope, and
+the finding IDs for the measured pair alongside the Yardstick declaration.
+The selected Todo's card takes precedence within the bounded read. The pinned
+Explore read retains the full evidence. Unbound reviews keep navigation until
+the Todo is selected. The read grants only evidence access.
+
+已绑定 Todo 的标尺若与正式测量反向，完整 Turn 的首读和分段 `review` 会显示
+分歧、正式测量更优的候选、代理指标的比较范围，以及实际测量发现和原标尺声明各自的 ID。
+已选 Todo 的提示在有上限的读取中优先交付，原捕获的 Explore 读取保留完整证据。
+待选择的复盘保留证据入口，绑定 Todo 后才交付该任务的提示。读取只提供证据访问。
 
 Captured replans also reference Explore attachment syntax already present in the
 same captured writer instead of repeating it in the entry work context. This
@@ -543,6 +639,18 @@ pending effects using the existing recovery path, then start a fresh Turn when
 permitted. Downgrading code must preserve journals and captures; deleting them
 is not rollback. This transport qualification does not establish live model,
 packaged App/Lark or overall convergence acceptance.
+
+Recovery previews and journal interpretation use the same typed plan reader.
+Supported historical records keep their original versions and bytes. An
+unsupported declared plan, envelope or action-signature version or coverage
+blocks resume. Journal inspection can report the invalid work contract without
+performing recovery or a debit. Retain the historical reader until the last
+supported journal and its recovery window are reconciled.
+
+恢复预览和 journal 解释共用同一个 typed plan reader。受支持的历史记录保留原版本和
+字节。显式声明不支持的 plan、envelope 或动作签名版本及覆盖范围时，恢复会停止。
+检查入口仍可报告契约无效，不执行恢复或扣额。保留历史读取器，直到最后一份受支持的
+journal 及其恢复窗口完成核对。
 
 Repair and replan diagnostics remain in the journal's typed `host_result`,
 including its summary and follow-up action. They do not implicitly replace Todo

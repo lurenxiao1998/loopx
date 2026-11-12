@@ -16,6 +16,122 @@ from loopx.capabilities.native_chat import external_conversations
 from loopx.extensions.lark.conversation_identity import identity_ref
 
 
+@pytest.mark.parametrize("message_field", [{}, {"message": None}, {"message": ""}, {"message": "  "}])
+def test_missing_final_message_preserves_visible_answer_without_promoting_metadata(tmp_path, language_server, message_field):
+    from test_antigravity_steward_adapter import adapter_for
+
+    raw = f'Original [report]({tmp_path}/report.md).\n<loopx-review-json>' + json.dumps({
+        **message_field, "decision": "none", "summary": "HIDDEN_NATIVE_SUMMARY", "context_handoff": [],
+    }) + '</loopx-review-json>'
+    language_server.update(plain_text=True, answers={0: raw})
+    adapter = adapter_for(tmp_path)
+    result = adapter.start_turn("Return the original result")
+    assert result["message"] == "Original report."
+    assert result["proposals"] == [] and result["gate"] is None
+    assert not result.get("context_handoff") and result["protected_action"] is None
+    assert "HIDDEN_NATIVE_SUMMARY" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("message_field", [{}, {"message": None}, {"message": " "}])
+@pytest.mark.parametrize("metadata", [
+    {"proposals": [{"kind": "todo", "text": "Preview a task"}]},
+    {"protected_action": {"operation": "merge", "target": "PR #1", "summary": "Review first"}},
+    {"gate": {"kind": "host_tool_gate", "summary": "Check the original gate", "next_action": "Review"}},
+])
+def test_missing_final_message_keeps_the_existing_metadata_contract(tmp_path, language_server, message_field, metadata):
+    from test_antigravity_steward_adapter import adapter_for
+    from loopx.chat import parse_agent_response
+
+    raw = 'Unrelated prefix\n<loopx-review-json>' + json.dumps({**message_field, **metadata}) + '</loopx-review-json>'
+    expected = parse_agent_response(raw, protected_paths=[tmp_path])
+    assert expected["message"] == ""
+    language_server.update(plain_text=True, answers={0: raw})
+    adapter = adapter_for(tmp_path)
+    assert adapter.start_turn("Preserve the existing typed metadata") == expected
+
+
+@pytest.mark.parametrize("fault", [None, "source-changed", "closed", "stop", "native-unavailable", "action", "lost-ack"])
+def test_original_queue_returns_missing_final_message_from_retained_native_result_without_replay(
+    steward, language_server, monkeypatch, fault,
+):
+    from loopx.chat import parse_agent_response
+    from loopx.extensions.lark.private_conversations import LarkPrivateConversations
+
+    monkeypatch.setenv("LOOPX_MANAGER_MODEL", "gemini-4-argon-high")
+    monkeypatch.setenv("LOOPX_MANAGER_REASONING_EFFORT", "high")
+    store, runtime, provider, transport, binding, _, _ = steward
+    binding = transport.bindings.configure(transport_ref="steward-app", project_ref=binding["project_ref"],
+        executor_endpoint_id="antigravity", context_kind="steward")
+    metadata = {"decision": "none", "summary": "HIDDEN_NATIVE_SUMMARY", "context_handoff": []}
+    if fault == "action":
+        metadata["proposals"] = [{"kind": "todo", "text": "Unsubmitted action"}]
+    language_server.update(plain_text=True, answers={0: 'Original verified result.\n<loopx-review-json>'
+        + json.dumps(metadata) + '</loopx-review-json>'})
+
+    def legacy_parser(text, **kwargs):
+        return {**parse_agent_response(text, **kwargs), "message": ""}
+
+    monkeypatch.setattr(native, "parse_agent_response", legacy_parser)
+    event = provider.event("steward-app", "missing-final-message", "Complete the original request")
+    transport.admit("steward-app", event)
+    ref = identity_ref(binding["provider_ref"], event["message_id"])
+    row = transport.core.read_request(ref)
+    completed = runtime.wait_for_turn(session_id=row["session_id"], turn_id=row["turn_id"], timeout_sec=15)
+    assert completed["status"] == "completed" and completed["response"]["message"] == ""
+    turn_bytes = store._turn_path(row["session_id"], row["turn_id"]).read_bytes()
+    event_bytes = store._event_path(row["session_id"], row["turn_id"]).read_bytes()
+    assert store.native_result(row["session_id"], row["turn_id"])
+    monkeypatch.setattr(native, "parse_agent_response", parse_agent_response)
+    monkeypatch.setattr(runtime, "enqueue_turn", lambda **_: pytest.fail("Result recovery enqueued business"))
+    monkeypatch.setattr(runtime, "resume_session_queue", lambda **_: pytest.fail("Result recovery resumed business"))
+    monkeypatch.setattr(native.AntigravityAdapter, "start_turn", lambda *_, **__: pytest.fail("Result recovery ran a model"))
+    if fault == "source-changed":
+        provider.messages[event["message_id"]]["content"] = "Changed original source"
+    elif fault == "closed":
+        store.update_session(row["session_id"], status="closed")
+    elif fault == "native-unavailable":
+        monkeypatch.setattr(native.AntigravityAdapter, "completed_result_observation", lambda **_: None)
+    elif fault == "lost-ack":
+        provider.lose_next_reply = True
+    writes = len(provider.writes)
+    restarted = LarkPrivateConversations(controller=runtime, runtime_root=transport.runtime_root,
+        runner=provider, cli_bin="lark-cli")
+    if fault == "stop":
+        monkeypatch.setattr(restarted.core, "_source_stop_observed", lambda *_, **__: True)
+    restarted.reconcile()
+    recovered = restarted.core.read_request(ref).get("native_result_recovery")
+    if fault == "lost-ack":
+        assert recovered and recovered["delivery_verified"] is False
+        journal = json.loads((restarted.root / f"{ref}.json").read_text())
+        assert journal["deliveries"]["terminal"]["started"]
+        assert not journal["deliveries"]["terminal"].get("attempt")
+        after = list(provider.writes)
+        restarted.reconcile()
+        assert provider.writes == after and len(provider.writes) == writes + 1
+        journal = json.loads((restarted.root / f"{ref}.json").read_text())
+        assert journal["deliveries"]["terminal"]["blocker"] == "provider_delivery_receipt_unknown"
+    elif fault == "action":
+        assert recovered is None
+        assert all("待办尚未写入" in text for _, text in provider.writes[writes:])
+        assert restarted.core.read_request(ref).get("native_result_recovery") is None
+    elif fault:
+        assert recovered is None and len(provider.writes) == writes
+    else:
+        assert recovered["delivery_verified"] is True
+        assert restarted.core.read_request(ref)["delivery_verified"] is True
+        journal = json.loads((restarted.root / f"{ref}.json").read_text())
+        assert journal["status"] == "delivered" and journal["deliveries"]["terminal"]["verified"]
+        terminal = journal["deliveries"]["terminal"]
+        assert "Original verified result." in terminal["text"]
+        assert "HIDDEN_NATIVE_SUMMARY" not in terminal["text"]
+        assert provider.messages[terminal["attempt"]["message_ref"]]["chat_id"] == event["chat_id"]
+        after = list(provider.writes)
+        assert restarted.reconcile() == 0 and provider.writes == after
+    assert store._turn_path(row["session_id"], row["turn_id"]).read_bytes() == turn_bytes
+    assert store._event_path(row["session_id"], row["turn_id"]).read_bytes() == event_bytes
+    assert [method for method, _ in language_server["calls"]].count("SendUserCascadeMessage") == 1
+
+
 @pytest.mark.parametrize("status, expected", [
     ("DONE", "completed"), ("ERROR", "failed"), ("RUNNING", None),
     ("GENERATING", None), ("WAITING", None), ("CANCELED", None), ("CLEARED", None),
@@ -128,6 +244,61 @@ def test_original_native_code_action_result_survives_later_timeout_without_repla
     assert [method for method, _ in language_server["calls"]].count("SendUserCascadeMessage") == 1
 
 
+@pytest.mark.parametrize("embedded", ["complete", "short", "foreign", "wrong_input", "missing_payload"])
+def test_native_running_poll_reuses_only_complete_steps_for_the_current_input(
+    tmp_path, language_server, monkeypatch, embedded,
+):
+    from test_antigravity_steward_adapter import adapter_for, _native_clock, _native_frames
+
+    adapter = adapter_for(tmp_path)
+    older_input = {"type": "CORTEX_STEP_TYPE_USER_INPUT", "status": "CORTEX_STEP_STATUS_DONE",
+        "metadata": {"sourceTrajectoryStepInfo": {"stepIndex": 0}},
+        "userInput": {"items": [{"text": "An earlier request"}]}}
+    frames = _native_frames()
+    for frame in frames:
+        for index, step in enumerate(frame["steps"], start=1):
+            step["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = index
+        frame["steps"].insert(0, deepcopy(older_input))
+    _native_clock(monkeypatch, language_server, frames)
+    rpc = native._rpc_post
+    detail_reads = []
+
+    def read(url, csrf, method, payload, timeout):
+        result = rpc(url, csrf, method, payload, timeout=timeout)
+        if method == "GetCascadeTrajectorySteps":
+            detail_reads.append(language_server["frame"]["status"])
+        if method != "GetCascadeTrajectory":
+            return result
+        if not language_server["sent_count"]:
+            return {**result, "numTotalSteps": 1}
+        steps = deepcopy(language_server["frame"]["steps"])
+        steps[1]["userInput"] = {"items": [{"text": language_server["inputs"][0]["text"]}]}
+        trajectory = {**result["trajectory"], "steps": steps}
+        if result["status"] == "CASCADE_RUN_STATUS_IDLE":
+            steps[-1]["plannerResponse"]["response"] = "Stale embedded final"
+        elif embedded == "short":
+            steps.pop(0)
+        elif embedded == "foreign":
+            trajectory["cascadeId"] = "unrelated-cascade"
+        elif embedded == "wrong_input":
+            steps[1]["userInput"]["items"][0]["text"] = "Another invocation"
+        elif embedded == "missing_payload":
+            steps[-1].pop("plannerResponse")
+        return {**result, "trajectory": trajectory}
+
+    monkeypatch.setattr(native, "_rpc_post", read)
+    events = []
+    result = adapter.start_turn("Return the original result", event_sink=lambda kind, data: events.append((kind, data)))
+    assert result["message"] == "native final"
+    assert any(kind == "answer.delta" and "progress" in data["text"] for kind, data in events)
+    assert "Stale embedded final" not in json.dumps(events)
+    assert detail_reads.count("CASCADE_RUN_STATUS_IDLE") == 1
+    assert detail_reads.count("CASCADE_RUN_STATUS_RUNNING") == (0 if embedded == "complete" else 4)
+    methods = [method for method, _ in language_server["calls"]]
+    assert methods.count("SendUserCascadeMessage") == 1
+    assert "CancelCascadeInvocation" not in methods
+
+
 @pytest.mark.parametrize("hard_limit, native_error", [(None, True), (150.0, True), (None, False)])
 def test_native_timeout_reports_its_clock_without_extending_native_retry(
     tmp_path, language_server, monkeypatch, hard_limit, native_error,
@@ -164,6 +335,49 @@ def test_native_timeout_reports_its_clock_without_extending_native_retry(
     assert "NATIVE_PRIVATE_SENTINEL" not in serialized and "/private/host" not in serialized
     errors = [data for kind, data in events if data.get("method") == "native/error"]
     assert len(errors) == diagnostic["native_error_count"]
+
+
+def test_original_steward_observes_native_work_at_idle_deadline_and_replies_once(
+    steward, language_server, monkeypatch,
+):
+    from test_antigravity_steward_adapter import _native_clock
+
+    monkeypatch.setenv("LOOPX_MANAGER_MODEL", "gemini-4-argon-high")
+    monkeypatch.setenv("LOOPX_MANAGER_REASONING_EFFORT", "high")
+    _, runtime, provider, transport, binding, _, _ = steward
+    binding = transport.bindings.configure(transport_ref="steward-app", project_ref=binding["project_ref"],
+        executor_endpoint_id="antigravity", context_kind="steward")
+    runtime.hard_timeout_sec = None
+
+    user = {"type": "CORTEX_STEP_TYPE_USER_INPUT", "status": "CORTEX_STEP_STATUS_DONE"}
+    previous = {"type": "CORTEX_STEP_TYPE_RUN_COMMAND", "status": "CORTEX_STEP_STATUS_DONE"}
+    resumed = {"type": "CORTEX_STEP_TYPE_RUN_COMMAND", "status": "CORTEX_STEP_STATUS_RUNNING"}
+    finished = {**resumed, "status": "CORTEX_STEP_STATUS_DONE"}
+    final = {"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE", "status": "CORTEX_STEP_STATUS_DONE",
+             "plannerResponse": {"response": "Original answer", "stopReason": "STOP_REASON_STOP_PATTERN"}}
+    _native_clock(monkeypatch, language_server, [
+        {"at": 1, "steps": [user, previous], "status": "CASCADE_RUN_STATUS_RUNNING"},
+        {"at": 302, "steps": [user, previous], "status": "CASCADE_RUN_STATUS_RUNNING"},
+        {"at": 302.01, "steps": [user, previous, resumed], "status": "CASCADE_RUN_STATUS_RUNNING"},
+        {"at": 304, "steps": [user, previous, finished, final], "status": "CASCADE_RUN_STATUS_IDLE"},
+    ])
+
+    source = provider.event("steward-app", "idle-deadline-source", "Finish this request")
+    transport.admit("steward-app", source)
+    ref = identity_ref(binding["provider_ref"], source["message_id"])
+    row = transport.core.read_request(ref)
+    done = runtime.wait_for_turn(session_id=row["session_id"], turn_id=row["turn_id"], timeout_sec=8)
+
+    assert done["status"] == "completed" and done["response"]["message"] == "Original answer"
+    assert transport.reconcile() == 1
+    delivery = json.loads((transport.root / f"{ref}.json").read_text())["deliveries"]["terminal"]
+    assert delivery["verified"] and delivery["text"] == done["response"]["message"]
+    returned = provider.messages[delivery["attempt"]["message_ref"]]
+    assert returned["chat_id"] == source["chat_id"]
+    assert "Original answer" in json.dumps(returned["body"])
+    assert transport.reconcile() == 0
+    assert sum(method == "SendUserCascadeMessage" for method, _ in language_server["calls"]) == 1
+    assert not language_server["cancelled"].is_set()
 
 
 @pytest.mark.parametrize("kind, expected", [
@@ -334,6 +548,112 @@ def test_idle_native_error_keeps_only_unsettled_work_cancellable(
     assert methods.count("CancelCascadeInvocation") == int(cancellation_needed)
     assert ("cancellation remains unconfirmed" in str(error)) is cancellation_needed
     assert not any(kind in {"turn.native_result", "answer.final"} for kind, _ in events)
+
+
+def _native_frames_after_cleared_error(*, answer_at=20, show_error=False):
+    from test_antigravity_steward_adapter import _native_frames
+
+    original, answer = _native_frames()[-1]["steps"]
+    error = {
+        "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+        "status": "CORTEX_STEP_STATUS_CLEARED",
+        "metadata": {"sourceTrajectoryStepInfo": {"stepIndex": 1}},
+        "errorMessage": {
+            "shouldShowUser": show_error,
+            "error": {"shortError": "Synthetic upstream EOF"},
+        },
+    }
+    answer["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 2
+    idle = "CASCADE_RUN_STATUS_IDLE"
+    return [
+        {"at": 10, "status": idle, "steps": [original, error]},
+        {"at": answer_at if answer_at is not None else 311, "status": idle,
+         "steps": [original, error, answer] if answer_at is not None else [original, error]},
+    ]
+
+
+def test_steward_returns_original_reply_after_cleared_native_error(steward, language_server, monkeypatch):
+    from test_antigravity_steward_adapter import _native_clock
+
+    monkeypatch.setenv("LOOPX_MANAGER_MODEL", "gemini-4-argon-high")
+    monkeypatch.setenv("LOOPX_MANAGER_REASONING_EFFORT", "high")
+    _, runtime, provider, transport, binding, _, _ = steward
+    binding = transport.bindings.configure(
+        transport_ref="steward-app", project_ref=binding["project_ref"],
+        executor_endpoint_id="antigravity", context_kind="steward",
+    )
+    _native_clock(monkeypatch, language_server, _native_frames_after_cleared_error())
+    source = provider.event("steward-app", "cleared-native-error", "Complete this original request")
+    transport.admit("steward-app", source)
+    ref = identity_ref(binding["provider_ref"], source["message_id"])
+    row = transport.core.read_request(ref)
+    completed = runtime.wait_for_turn(session_id=row["session_id"], turn_id=row["turn_id"], timeout_sec=8)
+    assert completed["status"] == "completed"
+    assert completed["response"]["message"] == "native final"
+    assert transport.reconcile() == 1
+    saved = json.loads((transport.root / f"{ref}.json").read_text())
+    terminal = saved["deliveries"]["terminal"]
+    assert terminal["verified"]
+    reply = provider.messages[terminal["attempt"]["message_ref"]]
+    assert reply["chat_id"] == source["chat_id"]
+    assert "native final" in json.dumps(reply["body"])
+    assert transport.reconcile() == 0
+    methods = [method for method, _ in language_server["calls"]]
+    assert methods.count("SendUserCascadeMessage") == 1
+    assert "CancelCascadeInvocation" not in methods
+
+
+@pytest.mark.parametrize("answer_at, hard_limit, timeout_kind", [
+    (None, None, "idle"),
+    (20, 15, "hard"),
+])
+def test_cleared_native_error_does_not_extend_deadline(
+    tmp_path, language_server, monkeypatch, answer_at, hard_limit, timeout_kind,
+):
+    from test_antigravity_steward_adapter import _native_clock, adapter_for
+    from loopx.capabilities.native_chat import antigravity_adapter
+    from loopx.chat_agent import CodexChatAgentError
+
+    frames = _native_frames_after_cleared_error(answer_at=answer_at)
+    idle_boundary = frames[-1]["at"]
+    _native_clock(monkeypatch, language_server, frames)
+    rpc_post = antigravity_adapter._rpc_post
+    final_reads = 0
+
+    def bounded_read(url, token, method, args, **kwargs):
+        nonlocal final_reads
+        if (timeout_kind == "idle" and method == "GetCascadeTrajectory"
+                and language_server["active"] and language_server["now"] >= idle_boundary):
+            final_reads += 1
+            if final_reads > 1:
+                pytest.fail("An unchanged cleared error started another final idle observation")
+        return rpc_post(url, token, method, args, **kwargs)
+
+    monkeypatch.setattr(antigravity_adapter, "_rpc_post", bounded_read)
+    adapter = adapter_for(tmp_path, hard_timeout_sec=hard_limit)
+    events = []
+    with pytest.raises(CodexChatAgentError) as raised:
+        adapter.start_turn("Complete this original request", lambda kind, data: events.append((kind, data)))
+    assert raised.value.error_code == "response_timeout"
+    assert raised.value.native_error_info["timeout"]["kind"] == timeout_kind
+    assert not any(kind in {"turn.native_result", "answer.final"} for kind, _ in events)
+    methods = [method for method, _ in language_server["calls"]]
+    assert methods.count("SendUserCascadeMessage") == 1
+    assert methods.count("CancelCascadeInvocation") == 1
+
+
+def test_user_visible_cleared_native_error_keeps_failure(tmp_path, language_server, monkeypatch):
+    from test_antigravity_steward_adapter import _native_clock, adapter_for
+    from loopx.chat_agent import CodexChatAgentError
+
+    _native_clock(monkeypatch, language_server, _native_frames_after_cleared_error(show_error=True))
+    with pytest.raises(CodexChatAgentError) as raised:
+        adapter_for(tmp_path).start_turn("Complete this original request")
+    assert raised.value.error_code == "antigravity_step_error"
+    assert raised.value.native_error_info == {"shortError": "Synthetic upstream EOF"}
+    methods = [method for method, _ in language_server["calls"]]
+    assert methods.count("SendUserCascadeMessage") == 1
+    assert methods.count("CancelCascadeInvocation") == 1
 
 
 def test_settled_native_error_releases_core_for_independent_input(tmp_path, language_server):
@@ -576,6 +896,11 @@ def test_restarted_codex_steward_gets_one_original_read_only_answer(steward, mon
             restarted.admit("steward-app", later)
             next_row = restarted.core.read_request(identity_ref(binding["provider_ref"], later["message_id"]))
             next_turn = runtime.wait_for_turn(session_id=sid, turn_id=next_row["turn_id"], timeout_sec=15)
+            preparation = next_turn["native_context_preparation"]
+            assert preparation["source_thread_id"] == "working-thread", "observe the inherited working thread, not the isolated review"
+            assert preparation["planned_method"] == ("thread/resume" if fault == "checkpoint-empty" else "thread/fork")
+            assert preparation["history_message_count"] == (0 if fault == "checkpoint-empty" else 1)
+            assert preparation["native_checkpoint_requested"] and preparation["working_checkpoint_available"]
             packets = [json.loads(line) for line in capture.read_text().splitlines()][len(calls):]
             methods = [packet["method"] for packet in packets]
             assert "thread/start" not in methods and "thread/compact/start" not in methods

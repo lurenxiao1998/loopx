@@ -134,8 +134,25 @@ function unchanged(a: unknown, b: unknown, message = "checkpoint source moved; r
 }
 async function absentDestination(path: string): Promise<void> {
   await physical(dirname(path));
-  try {await lstat(path); throw new Error("checkpoint destination already exists");}
-  catch (error) {if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;}
+  try {await lstat(path);}
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  throw new EffectRuntimeConflictError("checkpoint destination already exists");
+}
+async function publishCheckpointDirectory(staging: string, destination: string): Promise<void> {
+  try {await publishNewDirectory(staging, destination);}
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    const permissionFailure = code === "EACCES" || code === "EPERM";
+    // A directory rename can report a permission error for an occupied target.
+    // Confirm the entry exists before changing the meaning of that error.
+    const occupied = code === "EEXIST" || code === "ENOTEMPTY" ||
+      (permissionFailure && await lstat(destination).then(() => true, () => false));
+    if (occupied) throw new EffectRuntimeConflictError("checkpoint destination already exists");
+    throw error;
+  }
 }
 async function sqliteFile(path: string): Promise<boolean> {
   const handle = await open(path, "r");
@@ -210,11 +227,16 @@ function manifestBody(raw: unknown): JsonObject {
   requireJsonObject(value.artifact_witness, "checkpoint artifact witness");
   return value;
 }
+async function readReviewedManifest(root: string, expected: unknown): Promise<JsonObject> {
+  const path = join(root, "checkpoint.json");
+  await physical(path);
+  const manifest = manifestBody(JSON.parse(await readFile(path, "utf8")));
+  if (manifest.sha256 !== expected) throw new EffectRuntimeRequestError("checkpoint reviewed digest mismatch");
+  return manifest;
+}
 async function verify(root: string, expected: unknown): Promise<JsonObject> {
   await physical(root);
-  await physical(join(root, "checkpoint.json"));
-  const value = manifestBody(JSON.parse(await readFile(join(root, "checkpoint.json"), "utf8")));
-  if (value.sha256 !== expected) throw new Error("checkpoint reviewed digest mismatch");
+  const value = await readReviewedManifest(root, expected);
   const entries = components(value.components);
   const actual = await witness(entries.map(c => ({id: c.id, source_path: join(root, "components", c.id)})), false);
   unchanged(value.artifact_witness, actual, "checkpoint artifact members differ from the reviewed capture");
@@ -322,7 +344,9 @@ export async function checkpointArtifacts(value: unknown): Promise<JsonObject> {
     // Typed refusals keep their reason through the runtime boundary, so a
     // refused handoff is diagnosable instead of an opaque internal failure.
     const mismatch = () => new EffectRuntimeRequestError("checkpoint replan does not match the current admitted identity");
-    if (!hasExactAuthorityKeys(request, ["action", "quota", "goal_id", "agent_id", "turn_instance_id"])) {
+    const fields = ["action", "quota", "goal_id", "agent_id", "turn_instance_id"];
+    if (Object.hasOwn(request, "source_number_tokens")) fields.push("source_number_tokens");
+    if (!hasExactAuthorityKeys(request, fields)) {
       throw new Error("checkpoint replan selection fields are invalid");
     }
     const quota = requireJsonObject(request.quota, "checkpoint quota readback");
@@ -330,6 +354,15 @@ export async function checkpointArtifacts(value: unknown): Promise<JsonObject> {
     const agent = requireNonEmptyString(request.agent_id, "checkpoint agent");
     const turn = requireNonEmptyString(request.turn_instance_id, "checkpoint Turn");
     if (quota.ok !== true || quota.goal_id !== goal) throw new EffectRuntimeRequestError("checkpoint requires a matching current quota readback");
+    // A transport digest covers the file, not the contract sealed inside it.
+    // Historical original quota files were unversioned. A declared version
+    // or binding must go through the current owner before any intent is used.
+    if (Object.hasOwn(quota, "schema_version") || Object.hasOwn(quota, "contract_binding")) {
+      const {requireCompleteTurnDecision} = await import("../quota/turn_envelope.ts");
+      requireCompleteTurnDecision(quota, request.source_number_tokens);
+    } else if (Object.hasOwn(request, "source_number_tokens")) {
+      throw new EffectRuntimeRequestError("checkpoint source numbers require a complete Turn decision");
+    }
     if (quota.effective_action !== EffectiveAction.AUTONOMOUS_REPLAN_REQUIRED) {
       return {capture: false, reason: "no_fresh_replan", execution_authority_granted: false};
     }
@@ -386,9 +419,7 @@ export async function checkpointArtifacts(value: unknown): Promise<JsonObject> {
   if (request.action === "read_basis") {
     if (!hasExactAuthorityKeys(request, ["action", "root", "expected_sha256"])) throw new Error("checkpoint basis fields are invalid");
     const root = absolute(request.root, "checkpoint root");
-    await physical(join(root, "checkpoint.json"));
-    const manifest = manifestBody(JSON.parse(await readFile(join(root, "checkpoint.json"), "utf8")));
-    if (manifest.sha256 !== request.expected_sha256) throw new Error("checkpoint reviewed digest mismatch");
+    const manifest = await readReviewedManifest(root, request.expected_sha256);
     // This reads a digest-bound declaration after admission's full member
     // verification. It does not claim current integrity of every component.
     return {point_metadata: manifest.point_metadata, components: manifest.components,
@@ -427,7 +458,7 @@ export async function checkpointArtifacts(value: unknown): Promise<JsonObject> {
       await copyComponent(root, join(staging, "unit"), false);
       await verify(join(staging, "unit"), request.expected_sha256);
       withinDeadline();
-      await publishNewDirectory(join(staging, "unit"), destination);
+      await publishCheckpointDirectory(join(staging, "unit"), destination);
       return {...verification, materialized: true, activation_performed: false};
     }
     const sources = components(request.components);
@@ -462,7 +493,7 @@ export async function checkpointArtifacts(value: unknown): Promise<JsonObject> {
     await verify(staging, manifest.sha256);
     unchanged(before, await witness(sources));
     withinDeadline();
-    await publishNewDirectory(staging, destination);
+    await publishCheckpointDirectory(staging, destination);
     return {...await verify(destination, manifest.sha256), source_stability_verified: true};
   } finally {await rm(staging, {recursive: true, force: true});}
 }

@@ -44,6 +44,9 @@ if "loopx.extensions.process_runtime" in _sys.modules:
         globals()[_name] = getattr(_sys.modules["loopx.extensions.process_runtime"], _name)
 
 
+_RUNNING_CHECK_SECONDS = 1.0
+
+
 class GuardedHostBridge:
     """Keep at most one transient output frame while stdin is backpressured."""
 
@@ -51,11 +54,11 @@ class GuardedHostBridge:
         assert process.stdout is not None
         self.output = process.stdout
         self.process, self.deadline, self.cleanup_timeout = process, deadline, cleanup_timeout
-        self.next_running_check = time.monotonic() + 1
         self.pending: queue.Queue[str | BaseException | None] = queue.Queue(maxsize=1)
         self._stop_reading = threading.Event()
         self.requested = self.cancelled = self.not_launched = False
         self.result: dict[str, Any] | None = None
+        self._next_running_check = 0.0
         self.reader = threading.Thread(target=self._read, name="loopx-host-bridge-reader", daemon=True)
         self.reader.start()
 
@@ -77,21 +80,20 @@ class GuardedHostBridge:
 
     def next(self, *, deadline: float | None = None,
              check_running: Callable[[], None] | None = None) -> dict[str, Any] | None:
-        # A launch/cleanup deadline always belongs to its existing owner.
-        # After spawn, recheck admission even while there are no output frames.
         while True:
-            cutoff = deadline
-            if deadline is None and check_running is not None:
-                if time.monotonic() >= self.next_running_check:
+            read_until = deadline
+            if check_running is not None:
+                if time.monotonic() >= self._next_running_check:
                     check_running()
-                    self.next_running_check = time.monotonic() + 1
-                cutoff = self.next_running_check
+                    self._next_running_check = time.monotonic() + _RUNNING_CHECK_SECONDS
+                read_until = self._next_running_check
             try:
-                item = self.pending.get(timeout=None if cutoff is None else max(0, cutoff - time.monotonic()))
-                break
+                item = self.pending.get(timeout=None if read_until is None else max(0, read_until - time.monotonic()))
             except queue.Empty:
-                if deadline is not None:
+                if check_running is None:
                     raise TimeoutError("managed Host bridge launch deadline expired") from None
+            else:
+                break
         if isinstance(item, BaseException):
             raise item
         if item is None:
